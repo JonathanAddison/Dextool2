@@ -40,6 +40,7 @@ static void detect(){
 }
 namespace diag {
 std::string dir(){ return g_dir; }
+JavaVM* vm(){ return g_vm; }
 void setDir(const std::string& d){ if(!d.empty()) mkdirs(d.c_str()); }
 void log(const char* fmt,...){
   char buf[256]; va_list ap; va_start(ap,fmt); vsnprintf(buf,sizeof buf,fmt,ap); va_end(ap);

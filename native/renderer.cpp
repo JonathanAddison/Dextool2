@@ -91,6 +91,18 @@ void tool_surface(void* win,int w,int h,float density){
   g_run.store(true); g_thr=std::thread(renderMain);
 }
 extern "C" __attribute__((visibility("default")))
+void tool_surface_from_java(void* surface,int w,int h,float density){
+  diag::log("tool_surface_from_java surface=%p %dx%d d=%.2f",surface,w,h,density);
+  JavaVM* vm=diag::vm();
+  if(!vm){ diag::log("FAIL no JavaVM"); return; }
+  JNIEnv* env=nullptr;
+  if(vm->GetEnv((void**)&env,JNI_VERSION_1_6)!=0||!env){ diag::log("FAIL GetEnv"); return; }
+  ANativeWindow* win=ANativeWindow_fromSurface(env,(jobject)surface);
+  if(!win){ diag::log("FAIL ANativeWindow_fromSurface null"); return; }
+  diag::log("ANativeWindow=%p",win);
+  tool_surface(win,w,h,density);
+}
+extern "C" __attribute__((visibility("default")))
 void tool_surface_resize(int w,int h){ g_w.store(w); g_h.store(h); }
 extern "C" __attribute__((visibility("default")))
 void tool_surface_destroy(){

@@ -22,6 +22,7 @@ function natives(){
   const g=n=>Module.getExportByName('libtool.so',n);
   NF={
     surface:new NativeFunction(g('tool_surface'),'void',['pointer','int','int','float']),
+              surfaceJava:new NativeFunction(g('tool_surface_from_java'),'void',['pointer','int','int','float']),
     resize:new NativeFunction(g('tool_surface_resize'),'void',['int','int']),
     destroy:new NativeFunction(g('tool_surface_destroy'),'void',[]),
     touch:new NativeFunction(g('tool_touch'),'int',['int','float','float']),
@@ -46,10 +47,13 @@ function attach(activity){
         implements:[Java.use('android.view.SurfaceHolder$Callback')],
         methods:{
           surfaceCreated(h){ try{
-            const win=N.aw(env,h.getSurface().$h);
+            D('sc: getSurface');
+            const s=h.getSurface();
+            if(s.$h===undefined||s.$h===null){ D('FAIL surface handle missing'); return; }
+            D('sc: surface handle='+s.$h);
             const r=h.getSurfaceFrame();
-            D('PASS surfaceCreated '+r.width()+'x'+r.height());
-            N.surface(win,r.width(),r.height(),density);
+            D('sc: frame '+r.width()+'x'+r.height());
+            N.surfaceJava(s.$h,r.width(),r.height(),density);
             D('PASS tool_surface called');
           }catch(e){ D('FAIL surfaceCreated '+e); } },
           surfaceChanged(h,f,w,hh){ N.resize(w,hh); },
