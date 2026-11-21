@@ -6,8 +6,6 @@
 #include <fstream>
 void toolSetDir(const std::string&);
 static int req(){ return G.nextReq++; }
-static json patchJson(const PatchRec& p);
-static json hookJson(const HookRec& h);
 static ImU32 typeCol(const std::string& t){
   if(t=="void") return IM_COL32(150,150,150,255);
   if(t=="boolean") return IM_COL32(255,120,180,255);
@@ -27,6 +25,8 @@ static std::string hookTemplate(const MethodInfo& m){
   s+="return orig();\n"; return s;
 }
 namespace ui {
+static json patchJson(const PatchRec& p);
+static json hookJson(const HookRec& h);
 void toast(const std::string& s){ G.toasts.push_back({s,4.0f}); }
 static std::vector<std::pair<std::string,long long>> g_openQueue;
 void openClass(const std::string& cls,long long h){ g_openQueue.push_back({cls,h}); }
