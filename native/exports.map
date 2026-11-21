@@ -1,0 +1,1 @@
+{ global: JNI_OnLoad; tool_surface; tool_surface_resize; tool_surface_destroy; tool_touch; tool_text; tool_special; local: *; };
