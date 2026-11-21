@@ -41,6 +41,7 @@ static void gumThread(){
   diag::log("qjs backend ok");
   GError* err=nullptr;
   std::string src((const char*)agent_js,agent_js_len);
+  diag::log("agent src bytes=%zu head=%.60s",src.size(),src.c_str());
   g_script=gum_script_backend_create_sync(be,"tool",src.c_str(),nullptr,nullptr,&err);
   if(err){ diag::log("script create ERROR: %s",err->message); return; }
   diag::log("script created");

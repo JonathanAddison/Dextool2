@@ -1,4 +1,4 @@
-const Java = require('frida-java-bridge');
+import Java from 'frida-java-bridge';
 let ctxRef=null, dirPath='', publish=true;
 let sslHooks=[], urlHook=null, recording=[], monitorOn=false;
 
@@ -170,5 +170,5 @@ function init(ctx,dir){
   ctxRef=ctx; dirPath=dir;
   installJavaCrash();
 }
-module.exports={init:init, dumpDex:dumpDex, record:record, monitor:monitor,
-                setPublish(p){ publish=p; }};
+function setPublish(p){ publish=p; }
+export { init, dumpDex, record, monitor, setPublish };

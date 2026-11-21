@@ -1,4 +1,4 @@
-const Java = require('frida-java-bridge');
+import Java from 'frida-java-bridge';
 function diag(m){ try{ send({t:'diag',msg:'overlay: '+m}); }catch(e){} }
 let nf=null, overlayView=null, proxy=null, lastText='', imeShown=false, currentDecor=null;
 function natives(){
@@ -119,4 +119,4 @@ function start(app){
     }catch(e){ diag('current activity attach skip: '+e); }
   }catch(e){ diag('start err '+e); }
 }
-module.exports={start:start};
+export { start };

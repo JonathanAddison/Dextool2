@@ -1,4 +1,5 @@
-const Java = require('frida-java-bridge');
+import Java from 'frida-java-bridge';
+import * as features from './features.js';
 const handles = new Map(); let nextH = 1;
 const state = new Map();   // key cls::name#ov -> {klass,name,ov,ret,types,patch,hook,track,record,trackId,installed}
 const fieldState = new Map(); // key cls::field -> {lockTimer,watchTimer,last,patch}
@@ -294,9 +295,10 @@ function dispatch(m){
   else if(t==='fieldSet'){ try{ setField(m.cls,m.name,m.h,m.type,m.val); send({t:'toast',msg:'field set'});}catch(e){send({t:'toast',msg:''+e});} }
   else if(t==='fieldGet'){ try{ send({t:'fieldVal', ctx:m.ctx, val:readField(m.cls,m.name,m.h)});}catch(e){send({t:'fieldVal',ctx:m.ctx,val:''+e});} }
   else if(t==='eval'){ try{ const r=(0,eval)(m.code); if(r!==undefined) console.log(''+r);}catch(e){console.log('ERROR '+e);} }
-  else if(t==='dump'){ require('./features').dumpDex(); }
-  else if(t==='record'){ require('./features').record(m.on,m.scope,state,getSt,ensure,maybeRemove); }
-  else if(t==='monitor'){ require('./features').monitor(m.on); }
-  else if(t==='settings'){ require('./features').setPublish(m.publish); }
+  else if(t==='dump'){ features.dumpDex(); }
+  else if(t==='record'){ features.record(m.on,m.scope,state,getSt,ensure,maybeRemove); }
+  else if(t==='monitor'){ features.monitor(m.on); }
+  else if(t==='settings'){ features.setPublish(m.publish); }
 }
-module.exports = { init(ctx){ appCtx=ctx; }, dispatch:dispatch, handles:handles, getSt:getSt, ensure:ensure, maybeRemove:maybeRemove };
+function init(ctx){ appCtx=ctx; }
+export { init, dispatch, handles, getSt, ensure, maybeRemove };

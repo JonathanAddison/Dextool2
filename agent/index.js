@@ -1,7 +1,7 @@
-const Java = require('frida-java-bridge');
-const core = require('./core');
-const overlay = require('./overlay');
-const features = require('./features');
+import Java from 'frida-java-bridge';
+import * as core from './core.js';
+import * as overlay from './overlay.js';
+import * as features from './features.js';
 function diag(m){ try{ send({t:'diag', msg:m}); }catch(e){} }
 const origLog = console.log.bind(console);
 ['log','warn','error'].forEach(k=>{
