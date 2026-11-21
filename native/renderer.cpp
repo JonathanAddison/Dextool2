@@ -1,4 +1,5 @@
 #include "state.h"
+#include "diag.h"
 #include <imgui.h>
 #include <imgui_impl_opengl3.h>
 #include <android/native_window.h>
@@ -18,6 +19,7 @@ static std::thread g_thr;
 static ImGuiContext* g_igui=nullptr;
 
 static void renderMain(){
+  diag::log("renderMain start");
   ANativeWindow* win=g_win.load();
   EGLDisplay dpy=eglGetDisplay(EGL_DEFAULT_DISPLAY);
   eglInitialize(dpy,nullptr,nullptr);
@@ -25,7 +27,7 @@ static void renderMain(){
     EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_ALPHA_SIZE,8,EGL_NONE};
   EGLConfig cfg; EGLint n=0;
   eglChooseConfig(dpy,cfgAttr,&cfg,1,&n);
-  if(!n){ ANativeWindow_release(win); return; }
+  if(!n){ diag::log("egl: no config"); ANativeWindow_release(win); return; }
   EGLSurface surf=eglCreateWindowSurface(dpy,cfg,win,nullptr);
   const EGLint ctxAttr[]={EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE};
   eglBindAPI(EGL_OPENGL_ES_API);
@@ -42,7 +44,9 @@ static void renderMain(){
   ImGui::StyleColorsDark();
   ImGui::GetStyle().ScaleAllSizes(d*0.9f);
   ImGui_ImplOpenGL3_Init("#version 300 es");
+  diag::log("imgui gl init ok");
   auto last=std::chrono::steady_clock::now();
+  diag::log("render loop start");
   while(g_run.load()){
     { std::lock_guard<std::mutex> lk(g_evMtx);
       for(auto& e:g_ev){
@@ -79,6 +83,7 @@ static void renderMain(){
 }
 extern "C" __attribute__((visibility("default")))
 void tool_surface(void* win,int w,int h,float density){
+  diag::log("tool_surface %dx%d d=%.2f",w,h,density);
   if(g_run.load()) return;
   g_win.store((ANativeWindow*)win); g_w.store(w); g_h.store(h); g_density.store(density);
   g_run.store(true); g_thr=std::thread(renderMain);

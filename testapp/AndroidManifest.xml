@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.example.tooltest">
   <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34"/>
+  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>
   <application android:label="ToolTest" android:theme="@android:style/Theme.Material.Light">
     <activity android:name=".MainActivity" android:exported="true">
       <intent-filter>

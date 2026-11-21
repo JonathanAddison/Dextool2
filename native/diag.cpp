@@ -114,7 +114,7 @@ static void publishOne(JNIEnv* env,jobject resolver,jobject dUri,jclass cvCls,jm
       env->SetByteArrayRegion(arr,0,sz,(jbyte*)buf.data());
       env->CallVoidMethod(os,write,arr,0,(jint)sz);
       env->CallVoidMethod(os,close);
-      if(env->ExceptionCheck()) env->ExceptionClear(); else ok=true;
+      if(env->ExceptionCheck()){ diag::log("publish write exception"); env->ExceptionClear(); } else { ok=true; diag::log("published %s",name.c_str()); }
       env->DeleteLocalRef(arr); env->DeleteLocalRef(os);
     }
     env->DeleteLocalRef(outUri);
@@ -124,14 +124,17 @@ static void publishOne(JNIEnv* env,jobject resolver,jobject dUri,jclass cvCls,jm
   if(ok&&renameAfter){ std::string done=path+".published"; rename(path.c_str(),done.c_str()); }
 }
 static void publishAll(){
+  diag::log("publish start");
   if(!g_vm) return;
   JNIEnv* env=nullptr;
   if(g_vm->AttachCurrentThread(&env,nullptr)!=0) return;
   jobject ctx=nullptr;
   for(int i=0;i<40&&!ctx;i++){ if(getCtx(env,&ctx)) break; usleep(250000); }
-  if(!ctx){ g_vm->DetachCurrentThread(); return; }
+  if(!ctx){ diag::log("publish: no context"); g_vm->DetachCurrentThread(); return; }
+  diag::log("publish: ctx ok");
   jclass bv=env->FindClass("android/os/Build$VERSION");
   int sdk=env->GetStaticIntField(bv,env->GetStaticFieldID(bv,"SDK_INT","I"));
+  diag::log("publish sdk=%d",sdk);
   jclass cc=env->FindClass("android/content/Context");
   jobject resolver=env->CallObjectMethod(ctx,env->GetMethodID(cc,"getContentResolver","()Landroid/content/ContentResolver;"));
   if(sdk>=29&&resolver){
@@ -158,7 +161,19 @@ static void publishAll(){
     env->DeleteLocalRef(ms);env->DeleteLocalRef(dUri);env->DeleteLocalRef(cvCls);
     env->DeleteLocalRef(cr);env->DeleteLocalRef(osCls);
   }
-  if(resolver) env->DeleteLocalRef(resolver);
+    if(sdk<29){
+      std::vector<std::string> files;
+      char pend[600]; snprintf(pend,sizeof pend,"%s/pending",g_dir);
+      DIR* d=opendir(pend); if(d){ dirent* e; while((e=readdir(d))){ std::string nm=e->d_name; if(nm[0]=='.') continue; files.push_back(std::string(pend)+"/"+nm);} closedir(d); }
+      files.push_back(std::string(g_dir)+"/diag.log");
+      for(auto& p:files){ FILE* in=fopen(p.c_str(),"rb"); if(!in) continue;
+        std::string base=p.substr(p.find_last_of('/')+1);
+        std::string out="/sdcard/Download/libtool_"+base;
+        FILE* o=fopen(out.c_str(),"wb"); if(!o){ diag::log("fallback open fail %s",out.c_str()); fclose(in); continue; }
+        char b[8192]; size_t r; while((r=fread(b,1,sizeof b,in))>0) fwrite(b,1,r,o);
+        fclose(in); fclose(o); diag::log("fallback published %s",out.c_str()); }
+    }
+    if(resolver) env->DeleteLocalRef(resolver);
   env->DeleteLocalRef(ctx); env->DeleteLocalRef(cc); env->DeleteLocalRef(bv);
   g_vm->DetachCurrentThread();
 }
