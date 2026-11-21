@@ -1,0 +1,124 @@
+name: hotfix-build
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fix diag include + ui namespace ambiguity
+        run: |
+          python3 - <<'PY'
+          import sys
+          def rep(path,old,new):
+              s=open(path,encoding='utf-8').read()
+              if old in s:
+                  open(path,'w',encoding='utf-8').write(s.replace(old,new,1)); print('patched',path)
+              elif new in s:
+                  print('already',path)
+              else:
+                  print('MISS',path,repr(old[:60])); sys.exit(1)
+
+          # 1) diag.cpp : missing #include
+          rep('native/diag.cpp','\n<sys/stat.h>\n','\n#include <sys/stat.h>\n')
+
+          # 2) ui.cpp : move forward decls into namespace ui (ADL ambiguity fix)
+          decl='static json patchJson(const PatchRec& p);\nstatic json hookJson(const HookRec& h);\n'
+          s=open('native/ui.cpp',encoding='utf-8').read()
+          if decl in s:
+              s=s.replace(decl,'',1)
+              open('native/ui.cpp','w',encoding='utf-8').write(s)
+              print('removed misplaced forward decls')
+          rep('native/ui.cpp','namespace ui {\n',
+              'namespace ui {\nstatic json patchJson(const PatchRec& p);\nstatic json hookJson(const HookRec& h);\n')
+          print('FIXES OK')
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || { git commit -m "fix diag include + ui ADL ambiguity [skip ci]"; git push; }
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with: { ndk-version: r26d }
+
+      - name: Build agent.js
+        run: |
+          npm install --no-fund --no-audit frida-compile@^16 frida-java-bridge@^6
+          mkdir -p build/generated
+          npx frida-compile agent/index.js -o build/agent.js
+          (cd build && xxd -i agent.js > generated/agent_js.h)
+
+      - name: Fetch devkits / imgui / json
+        run: |
+          mkdir -p deps
+          V="${FRIDA_VERSION:-16.7.19}"
+          for ABI in arm64 arm; do
+            URL="https://github.com/frida/frida/releases/download/$V/frida-gumjs-devkit-$V-android-$ABI.tar.xz"
+            if ! curl -fL -o devkit-$ABI.tar.xz "$URL"; then
+              V=$(curl -fsSL "https://api.github.com/repos/frida/frida/releases?per_page=100" | jq -r '[.[].tag_name | select(startswith("16."))][0]')
+              URL="https://github.com/frida/frida/releases/download/$V/frida-gumjs-devkit-$V-android-$ABI.tar.xz"
+              curl -fL -o devkit-$ABI.tar.xz "$URL"
+            fi
+            mkdir -p deps/gum-$ABI; tar -xf devkit-$ABI.tar.xz -C deps/gum-$ABI
+          done
+          git clone --depth 1 --branch v1.90.9 https://github.com/ocornut/imgui deps/imgui
+          mkdir -p deps/json/nlohmann
+          curl -fL -o deps/json/nlohmann/json.hpp https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
+
+      - name: Build libtool.so
+        run: |
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          for PAIR in "arm64-v8a:arm64" "armeabi-v7a:arm"; do
+            AABI="${PAIR%%:*}"; GABI="${PAIR##*:}"
+            cmake -S . -B build/$AABI -Wno-deprecated \
+              -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+              -DANDROID_ABI=$AABI -DANDROID_PLATFORM=android-26 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DGUM_DIR=$GITHUB_WORKSPACE/deps/gum-$GABI \
+              -DIMGUI_DIR=$GITHUB_WORKSPACE/deps/imgui \
+              -DJSON_DIR=$GITHUB_WORKSPACE/deps/json \
+              -DGEN_DIR=$GITHUB_WORKSPACE/build/generated
+            cmake --build build/$AABI -j$(nproc)
+          done
+          mkdir -p out/libs/arm64-v8a out/libs/armeabi-v7a
+          cp build/arm64-v8a/libtool.so out/libs/arm64-v8a/
+          cp build/armeabi-v7a/libtool.so out/libs/armeabi-v7a/
+
+      - name: Build test APK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-34" "build-tools;34.0.0" >/dev/null
+          BT=$ANDROID_HOME/build-tools/34.0.0
+          PJ=$ANDROID_HOME/platforms/android-34/android.jar
+          mkdir -p build/apk/obj
+          $BT/aapt2 link --manifest testapp/AndroidManifest.xml -I "$PJ" \
+            --min-sdk-version 26 --target-sdk-version 34 -o build/apk/base.apk
+          javac -source 8 -target 8 -bootclasspath "$PJ" -d build/apk/obj \
+            testapp/src/com/example/tooltest/MainActivity.java 2>/dev/null
+          $BT/d8 --release --min-api 26 --lib "$PJ" --output build/apk $(find build/apk/obj -name '*.class')
+          (cd build/apk && zip -j base.apk classes.dex)
+          cp -r out/libs build/apk/lib
+          (cd build/apk && zip -r base.apk lib)
+          $BT/zipalign -f 4 build/apk/base.apk build/apk/aligned.apk
+          keytool -genkeypair -keystore build/debug.keystore -alias k -keyalg RSA \
+            -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=tool"
+          $BT/apksigner sign --ks build/debug.keystore --ks-pass pass:android \
+            --key-pass pass:android --out out/tooltest.apk build/apk/aligned.apk
+
+      - name: Collect artifacts
+        run: |
+          cp tools/inject.py out/ 2>/dev/null || true
+          cp README.md out/ 2>/dev/null || true
+          cp out/libs/arm64-v8a/libtool.so out/libtool-arm64-v8a.so
+          cp out/libs/armeabi-v7a/libtool.so out/libtool-armeabi-v7a.so
+          zip -r out/sources.zip native agent testapp tools CMakeLists.txt README.md .github
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libtool-android
+          path: out/*
