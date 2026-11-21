@@ -1,45 +1,13 @@
-name: hotfix-build
+name: final-build
 on:
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Fix diag include + ui namespace ambiguity
-        run: |
-          python3 - <<'PY'
-          import sys
-          def rep(path,old,new):
-              s=open(path,encoding='utf-8').read()
-              if old in s:
-                  open(path,'w',encoding='utf-8').write(s.replace(old,new,1)); print('patched',path)
-              elif new in s:
-                  print('already',path)
-              else:
-                  print('MISS',path,repr(old[:60])); sys.exit(1)
-
-          # 1) diag.cpp : missing #include
-          rep('native/diag.cpp','\n<sys/stat.h>\n','\n#include <sys/stat.h>\n')
-
-          # 2) ui.cpp : move forward decls into namespace ui (ADL ambiguity fix)
-          decl='static json patchJson(const PatchRec& p);\nstatic json hookJson(const HookRec& h);\n'
-          s=open('native/ui.cpp',encoding='utf-8').read()
-          if decl in s:
-              s=s.replace(decl,'',1)
-              open('native/ui.cpp','w',encoding='utf-8').write(s)
-              print('removed misplaced forward decls')
-          rep('native/ui.cpp','namespace ui {\n',
-              'namespace ui {\nstatic json patchJson(const PatchRec& p);\nstatic json hookJson(const HookRec& h);\n')
-          print('FIXES OK')
-          PY
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet || { git commit -m "fix diag include + ui ADL ambiguity [skip ci]"; git push; }
 
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
@@ -90,35 +58,54 @@ jobs:
           cp build/arm64-v8a/libtool.so out/libs/arm64-v8a/
           cp build/armeabi-v7a/libtool.so out/libs/armeabi-v7a/
 
-      - name: Build test APK
+      - name: Upload libs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: libtool-libs
+          path: out/libs/**
+
+      - name: Build test APK (use preinstalled SDK)
         run: |
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-34" "build-tools;34.0.0" >/dev/null
-          BT=$ANDROID_HOME/build-tools/34.0.0
-          PJ=$ANDROID_HOME/platforms/android-34/android.jar
+          set -e
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)
+          PJ=$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)
+          if [ -z "$BT" ] || [ -z "$PJ" ]; then
+            SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+            yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+            "$SDKM" "platforms;android-34" "build-tools;34.0.0" || true
+            BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)
+            PJ=$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)
+          fi
+          [ -n "$BT" ] && [ -n "$PJ" ] || { echo "No Android SDK build-tools/platform found"; exit 1; }
+          BT="${BT%/}"
+          echo "Using BT=$BT"; echo "Using PJ=$PJ"
           mkdir -p build/apk/obj
-          $BT/aapt2 link --manifest testapp/AndroidManifest.xml -I "$PJ" \
+          "$BT/aapt2" link --manifest testapp/AndroidManifest.xml -I "$PJ" \
             --min-sdk-version 26 --target-sdk-version 34 -o build/apk/base.apk
-          javac -source 8 -target 8 -bootclasspath "$PJ" -d build/apk/obj \
-            testapp/src/com/example/tooltest/MainActivity.java 2>/dev/null
-          $BT/d8 --release --min-api 26 --lib "$PJ" --output build/apk $(find build/apk/obj -name '*.class')
+          javac -nowarn -source 8 -target 8 -bootclasspath "$PJ" -d build/apk/obj \
+            testapp/src/com/example/tooltest/MainActivity.java
+          "$BT/d8" --release --min-api 26 --lib "$PJ" --output build/apk $(find build/apk/obj -name '*.class')
           (cd build/apk && zip -j base.apk classes.dex)
           cp -r out/libs build/apk/lib
           (cd build/apk && zip -r base.apk lib)
-          $BT/zipalign -f 4 build/apk/base.apk build/apk/aligned.apk
+          "$BT/zipalign" -f 4 build/apk/base.apk build/apk/aligned.apk
           keytool -genkeypair -keystore build/debug.keystore -alias k -keyalg RSA \
             -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=tool"
-          $BT/apksigner sign --ks build/debug.keystore --ks-pass pass:android \
+          "$BT/apksigner" sign --ks build/debug.keystore --ks-pass pass:android \
             --key-pass pass:android --out out/tooltest.apk build/apk/aligned.apk
 
       - name: Collect artifacts
+        if: always()
         run: |
           cp tools/inject.py out/ 2>/dev/null || true
           cp README.md out/ 2>/dev/null || true
-          cp out/libs/arm64-v8a/libtool.so out/libtool-arm64-v8a.so
-          cp out/libs/armeabi-v7a/libtool.so out/libtool-armeabi-v7a.so
-          zip -r out/sources.zip native agent testapp tools CMakeLists.txt README.md .github
+          cp out/libs/arm64-v8a/libtool.so out/libtool-arm64-v8a.so 2>/dev/null || true
+          cp out/libs/armeabi-v7a/libtool.so out/libtool-armeabi-v7a.so 2>/dev/null || true
+          zip -r out/sources.zip native agent testapp tools CMakeLists.txt README.md .github 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: libtool-android
           path: out/*
