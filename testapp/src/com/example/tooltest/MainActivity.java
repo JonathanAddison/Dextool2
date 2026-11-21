@@ -13,10 +13,15 @@ public class MainActivity extends Activity {
     super.onCreate(b);
     LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL);
     TextView t = new TextView(this); t.setText("libtool test app - tap TOOL button");
-    EditText e = new EditText(this); e.setHint("name");
+    final EditText e = new EditText(this); e.setHint("name");
     Button btn = new Button(this); btn.setText("Call greet()");
-    TextView out = new TextView(this);
-    btn.setOnClickListener(v -> { out.setText(greet(e.getText().toString(), add(2,3))); logIt(out.getText().toString()); });
+    final TextView out = new TextView(this);
+    btn.setOnClickListener(new android.view.View.OnClickListener(){
+      @Override public void onClick(android.view.View v){
+        out.setText(greet(e.getText().toString(), add(2,3)));
+        logIt(out.getText().toString());
+      }
+    });
     l.addView(t); l.addView(e); l.addView(btn); l.addView(out);
     setContentView(l);
   }
