@@ -1,4 +1,4 @@
-name: fix-esm-clean
+name: stage0-smoke
 on:
   workflow_dispatch:
 permissions:
@@ -9,53 +9,217 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Convert agent to ESM + log embedded source head
+      - name: Install compat layer + smoke agent + native probes
         run: |
+          [ -f agent/index.full.js ] || cp agent/index.js agent/index.full.js
+
+          cat > agent/polyfill.js <<'EOF_POLY'
+          import { Buffer } from 'buffer';
+          globalThis.Buffer = Buffer;
+          globalThis.global = globalThis;
+          if (typeof globalThis.process === 'undefined') {
+            globalThis.process = { env:{}, platform:'android', version:'', versions:{},
+              nextTick:(f,...a)=>setTimeout(()=>f(...a),0) };
+          }
+          if (typeof globalThis.setImmediate === 'undefined') globalThis.setImmediate = (f,...a)=>setTimeout(()=>f(...a),0);
+          if (typeof globalThis.clearImmediate === 'undefined') globalThis.clearImmediate = id=>clearTimeout(id);
+          if (typeof globalThis.queueMicrotask === 'undefined') globalThis.queueMicrotask = f=>Promise.resolve().then(f);
+          if (typeof globalThis.TextEncoder === 'undefined') {
+            globalThis.TextEncoder = class TextEncoder {
+              get encoding(){ return 'utf-8'; }
+              encode(s=''){ s=String(s); const out=[];
+                for(let i=0;i<s.length;i++){ let c=s.codePointAt(i); if(c>0xffff)i++;
+                  if(c<0x80) out.push(c);
+                  else if(c<0x800) out.push(0xc0|(c>>6),0x80|(c&63));
+                  else if(c<0x10000) out.push(0xe0|(c>>12),0x80|((c>>6)&63),0x80|(c&63));
+                  else out.push(0xf0|(c>>18),0x80|((c>>12)&63),0x80|((c>>6)&63),0x80|(c&63)); }
+                return new Uint8Array(out); }
+              encodeInto(s,dst){ const b=this.encode(s); const n=Math.min(b.length,dst.length);
+                dst.set(b.subarray(0,n)); return {read:String(s).length,written:n}; }
+            };
+          }
+          if (typeof globalThis.TextDecoder === 'undefined') {
+            globalThis.TextDecoder = class TextDecoder {
+              constructor(enc='utf-8'){ this.encoding=String(enc).toLowerCase(); }
+              decode(input){ if(!input) return '';
+                const b = input instanceof ArrayBuffer ? new Uint8Array(input)
+                  : new Uint8Array(input.buffer, input.byteOffset||0, input.byteLength||input.length);
+                let s='', i=0;
+                while(i<b.length){ let c=b[i++], cp, extra;
+                  if(c<0x80){ cp=c; extra=0; }
+                  else if((c&0xe0)===0xc0){ cp=c&31; extra=1; }
+                  else if((c&0xf0)===0xe0){ cp=c&15; extra=2; }
+                  else if((c&0xf8)===0xf0){ cp=c&7; extra=3; }
+                  else { s+='\ufffd'; continue; }
+                  if(i+extra>b.length){ s+='\ufffd'; break; }
+                  let ok=true;
+                  for(let k=0;k<extra;k++){ const d=b[i++]; if((d&0xc0)!==0x80){ ok=false; break; } cp=(cp<<6)|(d&63); }
+                  if(!ok||cp>0x10ffff||(cp>=0xd800&&cp<=0xdfff)){ s+='\ufffd'; continue; }
+                  if(cp>0xffff){ cp-=0x10000; s+=String.fromCharCode(0xd800+(cp>>10),0xdc00+(cp&1023)); }
+                  else s+=String.fromCharCode(cp);
+                }
+                return s; }
+            };
+          }
+          EOF_POLY
+
+          cat > agent/index.js <<'EOF_SMOKE'
+          import './polyfill.js';
+          import Java from 'frida-java-bridge';
+
+          function D(m){ try{ send({t:'diag', msg:'SMOKE '+m}); }catch(e){} }
+          const origLog = console.log.bind(console);
+          ['log','warn','error'].forEach(k=>{
+            console[k]=(...a)=>{ const s=a.map(String).join(' '); D('console.'+k+': '+s); origLog(...a); };
+          });
+          function cmdLoop(m){
+            if(m && m.t==='ping') D('PASS native->agent roundtrip');
+            else D('cmd '+JSON.stringify(m));
+            recv('cmd',cmdLoop);
+          }
+          recv('cmd',cmdLoop);
+          D('start');
+          ['Buffer','TextEncoder','TextDecoder','setTimeout','NativeFunction','Module','Process','Interceptor','Memory']
+            .forEach(n=>D((typeof globalThis[n]!=='undefined'?'PASS global ':'FAIL global ')+n));
+
+          let tries=0, attached=false, NF=null;
+          function natives(){
+            if(NF) return NF;
+            const g=n=>Module.getExportByName('libtool.so',n);
+            NF={
+              surface:new NativeFunction(g('tool_surface'),'void',['pointer','int','int','float']),
+              resize:new NativeFunction(g('tool_surface_resize'),'void',['int','int']),
+              destroy:new NativeFunction(g('tool_surface_destroy'),'void',[]),
+              touch:new NativeFunction(g('tool_touch'),'int',['int','float','float']),
+              aw:new NativeFunction(Module.getExportByName('libandroid.so','ANativeWindow_fromSurface'),'pointer',['pointer','pointer'])
+            };
+            return NF;
+          }
+          function attach(activity){
+            if(attached) return; attached=true;
+            try{
+              Java.performNow(()=>{
+                D('attach begin');
+                const N=natives();
+                const SV=Java.use('android.view.SurfaceView');
+                const v=SV.$new(activity);
+                v.setZOrderOnTop(true);
+                v.getHolder().setFormat(Java.use('android.graphics.PixelFormat').TRANSLUCENT.value);
+                const density=activity.getResources().getDisplayMetrics().density.value;
+                const env=Java.vm.getEnv().handle;
+                const CB=Java.registerClass({
+                  name:'re.tool.SmokeCB'+Date.now(),
+                  implements:[Java.use('android.view.SurfaceHolder$Callback')],
+                  methods:{
+                    surfaceCreated(h){ try{
+                      const win=N.aw(env,h.getSurface().$h);
+                      const r=h.getSurfaceFrame();
+                      D('PASS surfaceCreated '+r.width()+'x'+r.height());
+                      N.surface(win,r.width(),r.height(),density);
+                      D('PASS tool_surface called');
+                    }catch(e){ D('FAIL surfaceCreated '+e); } },
+                    surfaceChanged(h,f,w,hh){ N.resize(w,hh); },
+                    surfaceDestroyed(h){ D('surfaceDestroyed'); N.destroy(); }
+                  }
+                });
+                v.getHolder().addCallback(CB.$new());
+                const T=Java.registerClass({
+                  name:'re.tool.SmokeTouch'+Date.now(),
+                  implements:[Java.use('android.view.View$OnTouchListener')],
+                  methods:{ onTouch(v,e){ const r=N.touch(e.getActionMasked(),e.getX(),e.getY()); return (r&1)!==0; } }
+                });
+                v.setOnTouchListener(T.$new());
+                const decor=activity.getWindow().getDecorView();
+                const VG=Java.use('android.view.ViewGroup');
+                const LP=Java.use('android.widget.FrameLayout$LayoutParams');
+                Java.cast(decor,VG).addView(v,LP.$new(-1,-1));
+                D('PASS overlay added');
+              });
+            }catch(e){ D('FAIL attach '+e); attached=false; }
+          }
+          function init(){
+            try{
+              Java.perform(()=>{
+                try{
+                  const app=Java.use('android.app.ActivityThread').currentApplication();
+                  if(app===null){ if(tries++<60) D('app null retry '+tries); setTimeout(init,250); return; }
+                  D('PASS Java.perform + app');
+                  const ctx=app.getApplicationContext();
+                  const File=Java.use('java.io.File');
+                  const dir=File.$new(ctx.getExternalFilesDir(null),'tool'); dir.mkdirs();
+                  const Build=Java.use('android.os.Build$VERSION');
+                  send({t:'paths', dir:dir.getAbsolutePath(), pkg:ctx.getPackageName(), sdk:Build.SDK_INT.value});
+                  D('PASS Java.use Build sdk='+Build.SDK_INT.value);
+                  const R=Java.registerClass({
+                    name:'re.tool.SmokeRunnable'+Date.now(),
+                    implements:[Java.use('java.lang.Runnable')],
+                    methods:{ run(){ D('PASS registerClass Runnable.run invoked'); } }
+                  });
+                  const r=R.$new();
+                  D('PASS registerClass created');
+                  r.run();
+                  const LC=Java.registerClass({
+                    name:'re.tool.SmokeLC'+Date.now(),
+                    implements:[Java.use('android.app.Application$ActivityLifecycleCallbacks')],
+                    methods:{
+                      onActivityCreated(a,b){}, onActivityStarted(a){},
+                      onActivityResumed(a){ D('onActivityResumed'); attach(a); },
+                      onActivityPaused(a){}, onActivityStopped(a){},
+                      onActivitySaveInstanceState(a,b){}, onActivityDestroyed(a){}
+                    }
+                  });
+                  app.registerActivityLifecycleCallbacks(LC.$new());
+                  D('PASS lifecycle registered');
+                  try{
+                    const at=Java.use('android.app.ActivityThread').currentActivityThread();
+                    const it=at.mActivities.value.values().iterator();
+                    while(it.hasNext()){ const rec=it.next(); const a=rec.activity.value;
+                      if(a!==null&&!a.isFinishing()){ attach(a); break; } }
+                  }catch(e){ D('current activity lookup skip: '+e); }
+                  D('READY'); send({t:'ready'});
+                }catch(e){ D('FAIL init '+e+' | '+(e.stack||'')); setTimeout(init,500); }
+              });
+            }catch(e){ D('FAIL perform '+e); setTimeout(init,500); }
+          }
+          init();
+          EOF_SMOKE
+
           python3 - <<'PY'
-          import re
-          def rd(p): return open(p,encoding='utf-8').read()
-          def wr(p,s): open(p,'w',encoding='utf-8').write(s)
-
-          s=rd('agent/index.js')
-          s=s.replace("const Java = require('frida-java-bridge');","import Java from 'frida-java-bridge';")
-          s=s.replace("const core = require('./core');","import * as core from './core.js';")
-          s=s.replace("const overlay = require('./overlay');","import * as overlay from './overlay.js';")
-          s=s.replace("const features = require('./features');","import * as features from './features.js';")
-          wr('agent/index.js',s)
-
-          s=rd('agent/core.js')
-          s=s.replace("const Java = require('frida-java-bridge');",
-                      "import Java from 'frida-java-bridge';\nimport * as features from './features.js';")
-          s=s.replace("require('./features').","features.")
-          s=re.sub(r"module\.exports\s*=\s*\{.*\};\s*$",
-                   "function init(ctx){ appCtx=ctx; }\nexport { init, dispatch, handles, getSt, ensure, maybeRemove };",
-                   s, flags=re.S)
-          wr('agent/core.js',s)
-
-          s=rd('agent/overlay.js')
-          s=s.replace("const Java = require('frida-java-bridge');","import Java from 'frida-java-bridge';")
-          s=re.sub(r"module\.exports\s*=\s*\{.*\};\s*$","export { start };",s,flags=re.S)
-          wr('agent/overlay.js',s)
-
-          s=rd('agent/features.js')
-          s=s.replace("const Java = require('frida-java-bridge');","import Java from 'frida-java-bridge';")
-          s=re.sub(r"module\.exports\s*=\s*\{.*\};\s*$",
-                   "function setPublish(p){ publish=p; }\nexport { init, dumpDex, record, monitor, setPublish };",
-                   s, flags=re.S)
-          wr('agent/features.js',s)
-
-          # log embedded agent head/size in native for no-adb debugging
-          m=rd('native/main.cpp')
-          old='std::string src((const char*)agent_js,agent_js_len);'
-          new=old+'\n  diag::log("agent src bytes=%zu head=%.60s",src.size(),src.c_str());'
-          if old in m and 'agent src bytes' not in m:
-              wr('native/main.cpp',m.replace(old,new,1))
-          print('ESM CONVERSION OK')
+          import sys
+          def rep(path,old,new):
+              s=open(path,encoding='utf-8').read()
+              if old in s:
+                  open(path,'w',encoding='utf-8').write(s.replace(old,new,1)); print('patched',path)
+              elif new in s:
+                  print('already',path)
+              else:
+                  print('MISS',path,repr(old[:70])); sys.exit(1)
+          # native->agent ping for roundtrip probe
+          rep('native/main.cpp','static void gumThread(){',
+              'static gboolean sendPing(gpointer){\n  if(g_script) gum_script_post(g_script,"{\\"type\\":\\"cmd\\",\\"t\\":\\"ping\\"}",nullptr);\n  return G_SOURCE_REMOVE;\n}\nstatic void gumThread(){')
+          rep('native/main.cpp','diag::log("script loaded");\n  g_main_loop_run(loop);',
+              'diag::log("script loaded");\n  g_timeout_add(1500,sendPing,nullptr);\n  g_main_loop_run(loop);')
+          # renderer probes
+          rep('native/renderer.cpp','eglMakeCurrent(dpy,surf,surf,ctx);',
+              'eglMakeCurrent(dpy,surf,surf,ctx);\n  diag::log("egl makeCurrent ok");')
+          rep('native/renderer.cpp','ImGui::Render();',
+              'ImGui::Render();\n    { static bool ff=false; if(!ff){ ff=true; diag::log("SMOKE PASS first ImGui frame"); } }')
+          # stop publish retry spam after first successful public publish
+          rep('native/diag.cpp','static bool g_diagPub=false;',
+              'static bool g_diagPub=false;\nstatic bool g_pubDone=false;')
+          rep('native/diag.cpp','for(int i=0;i<8;i++){ usleep(i==0?1500000:5000000); publishAll(); }',
+              'for(int i=0;i<8 && !g_pubDone;i++){ usleep(i==0?1500000:5000000); publishAll(); }')
+          rep('native/diag.cpp','if(base=="diag.log") g_diagPub=true;',
+              'if(base=="diag.log"){ g_diagPub=true; g_pubDone=true; }')
+          rep('native/diag.cpp','if(!g_diagPub){ publishOne(env,resolver,dUri,cvCls,cvInit,put,insert,openOS,write,close,diagp,false); g_diagPub=true; }',
+              'if(!g_diagPub){ publishOne(env,resolver,dUri,cvCls,cvInit,put,insert,openOS,write,close,diagp,false); g_diagPub=true; g_pubDone=true; }')
+          print('NATIVE PROBES OK')
           PY
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add agent native
-          git diff --cached --quiet || { git commit -m "agent: ESM imports (frida-compile requires import, not require) [skip ci]"; git push; }
+          git diff --cached --quiet || { git commit -m "stage0 smoke: compat layer + capability probes [skip ci]"; git push; }
 
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
@@ -63,17 +227,17 @@ jobs:
         id: ndk
         with: { ndk-version: r26d }
 
-      - name: Bundle agent (ESM) + strict verification
+      - name: Bundle smoke agent + strict verify
         run: |
           npm init -y >/dev/null
           node -e "const p=require('./package.json');p.type='module';require('fs').writeFileSync('package.json',JSON.stringify(p,null,2))"
-          npm install --no-fund --no-audit frida-compile@^16 frida-java-bridge@^6 esbuild
+          npm install --no-fund --no-audit frida-compile@^16 frida-java-bridge@^6 esbuild buffer@^6
           mkdir -p build/generated
-          verify(){ node --check build/agent.js && node -e "const s=require('fs').readFileSync('build/agent.js','utf8'); if(s.length<50000){console.error('bundle too small: '+s.length);process.exit(1)} if(/^\s*(import|export)[ {]/m.test(s)||/^\s*const .*=\s*require\(/m.test(s)||/^\s*require\(/m.test(s)){console.error('unbundled module statements remain');process.exit(1)} console.log('bundle verified, bytes='+s.length);"; }
-          npx frida-compile agent/index.js -o build/agent.js || true
+          verify(){ node --check build/agent.js && node -e "const s=require('fs').readFileSync('build/agent.js','utf8'); if(s.length<50000){console.error('too small '+s.length);process.exit(1)} if(/^\s*(import|export)[ {]/m.test(s)||/^\s*const .*=\s*require\(/m.test(s)||/^\s*require\(/m.test(s)){console.error('unbundled statements remain');process.exit(1)} if(!s.includes('Buffer')||!s.includes('SMOKE')){console.error('marker missing');process.exit(1)} console.log('bundle verified bytes='+s.length);"; }
+          npx frida-compile agent/index.js -o build/agent.js 2>build/fc.log || true
           if ! verify; then
-            echo "frida-compile output invalid -> esbuild fallback"
-            npx esbuild agent/index.js --bundle --format=iife --target=es2020 --platform=node --outfile=build/agent.js
+            echo "frida-compile invalid/failed:"; tail -20 build/fc.log || true
+            npx esbuild agent/index.js --bundle --format=iife --target=es2020 --platform=browser --define:global=globalThis --outfile=build/agent.js
             verify || { echo "BUNDLE FAILED"; head -c 400 build/agent.js; exit 1; }
           fi
           echo "--- agent head ---"; head -c 120 build/agent.js; echo
@@ -140,7 +304,7 @@ jobs:
       - name: Upload clean artifact (3 files only)
         uses: actions/upload-artifact@v4
         with:
-          name: libtool-clean
+          name: libtool-stage0
           path: |
             out/tooltest.apk
             out/libtool-arm64-v8a.so
