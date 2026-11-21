@@ -1,10 +1,13 @@
 #include "state.h"
+#include "diag.h"
 #include <imgui.h>
 #include <imgui_stdlib.h>
 #include <algorithm>
 #include <fstream>
 void toolSetDir(const std::string&);
 static int req(){ return G.nextReq++; }
+static json patchJson(const PatchRec& p);
+static json hookJson(const HookRec& h);
 static ImU32 typeCol(const std::string& t){
   if(t=="void") return IM_COL32(150,150,150,255);
   if(t=="boolean") return IM_COL32(255,120,180,255);
@@ -25,11 +28,16 @@ static std::string hookTemplate(const MethodInfo& m){
 }
 namespace ui {
 void toast(const std::string& s){ G.toasts.push_back({s,4.0f}); }
-void openClass(const std::string& cls,long long h){
-  ClassWindow w; w.id=G.nextWin++; w.isList=false; w.cls=cls; w.handle=h;
-  w.title=h?(cls+" @"+std::to_string(h)):cls;
-  G.wins.push_back(w); G.activeWin=w.id;
-  bridge::post({{"t","info"},{"id",req()},{"cls",cls},{"h",h},{"ctx",{{"w",w.id},{"k","info"}}}});
+static std::vector<std::pair<std::string,long long>> g_openQueue;
+void openClass(const std::string& cls,long long h){ g_openQueue.push_back({cls,h}); }
+static void flushOpen(){
+  for(auto& q:g_openQueue){
+    ClassWindow w; w.id=G.nextWin++; w.isList=false; w.cls=q.first; w.handle=q.second;
+    w.title=q.second?(q.first+" @"+std::to_string(q.second)):q.first;
+    G.wins.push_back(w); G.activeWin=w.id;
+    bridge::post({{"t","info"},{"id",req()},{"cls",q.first},{"h",q.second},{"ctx",{{"w",w.id},{"k","info"}}}});
+  }
+  g_openQueue.clear();
 }
 static ClassWindow* winById(int id){ for(auto& w:G.wins) if(w.id==id) return &w; return nullptr; }
 static ArgEditor* editorByCtx(ClassWindow& w,const json& c){
@@ -164,11 +172,14 @@ static void tabSettings(){
     bridge::post({{"t","settings"},{"publish",G.cfg.publishDownloads}});
     toast("saved");
   }
+  if(ImGui::Button("Export logs to Downloads")){ tool_export_logs(); toast("exporting logs..."); }
+  ImGui::TextWrapped("Diagnostics dir: %s", diag::dir().c_str());
   ImGui::Separator();
   ImGui::TextDisabled("libtool phase 1 - frida-gum embedded, no root/server/gadget.");
   ImGui::TextDisabled("Smali live edit: phase 2 (see README roadmap).");
 }
 static void tabPatches(){
+  std::vector<std::string> del;
   std::map<std::string,std::vector<std::string>> byCls;
   for(auto& [id,p]:G.patches) byCls[p.cls].push_back(id);
   for(auto& [cls,ids]:byCls){
@@ -182,7 +193,7 @@ static void tabPatches(){
       ImGui::SameLine();
       bool open=ImGui::TreeNode((p.member+(p.isField?" [field]":" [method]")).c_str());
       ImGui::SameLine(); if(ImGui::SmallButton("delete")){
-        bridge::post({{"t","patchDel"},{"id",id}}); G.patches.erase(id); ImGui::TreePop(); ImGui::PopID(); continue; }
+        bridge::post({{"t","patchDel"},{"id",id}}); del.push_back(id); if(open) ImGui::TreePop(); ImGui::PopID(); continue; }
       if(open){
         if(p.isField){
           std::string v=p.ret.value("v","");
@@ -206,6 +217,7 @@ static void tabPatches(){
     }
     ImGui::TreePop();
   }
+  for(auto& d:del) G.patches.erase(d);
   if(G.patches.empty()) ImGui::TextDisabled("No patches. Register from Classes tab.");
 }
 static json patchJson(const PatchRec& p){
@@ -217,6 +229,7 @@ static json hookJson(const HookRec& h){
               {"code",h.code},{"enabled",h.enabled},{"ret",h.ret}};
 }
 static void tabHooks(){
+  std::vector<std::string> del;
   for(auto& [id,h0]:G.hooks){
     HookRec h=h0; ImGui::PushID(id.c_str());
     bool en=h.enabled;
@@ -224,7 +237,7 @@ static void tabHooks(){
     ImGui::SameLine();
     bool open=ImGui::TreeNode((h.cls+"::"+h.name).c_str());
     ImGui::SameLine(); if(ImGui::SmallButton("delete")){
-      bridge::post({{"t","hookDel"},{"id",id}}); G.hooks.erase(id); if(open)ImGui::TreePop(); ImGui::PopID(); continue; }
+      bridge::post({{"t","hookDel"},{"id",id}}); del.push_back(id); if(open)ImGui::TreePop(); ImGui::PopID(); continue; }
     if(open){
       int mode=h.mode=="java"?0:(h.mode=="smali"?1:2);
       ImGui::Combo("mode",&mode,"Java (JS)\0Smali (phase 2)\0Noop\0");
@@ -239,9 +252,11 @@ static void tabHooks(){
     }
     ImGui::PopID();
   }
+  for(auto& d:del) G.hooks.erase(d);
   if(G.hooks.empty()) ImGui::TextDisabled("No hooks. Register from Classes tab.");
 }
 static void tabTrackers(){
+  std::vector<std::string> del;
   for(auto& [id,t0]:G.tracks){
     TrackRec t=t0; ImGui::PushID(id.c_str());
     bool en=t.enabled;
@@ -252,7 +267,7 @@ static void tabTrackers(){
     ImGui::SameLine(); if(ImGui::SmallButton("clear")) G.tracks[id].log.clear();
     ImGui::SameLine(); if(ImGui::SmallButton("delete")){
       bridge::post({{"t","trackDel"},{"id",id},{"cls",t.cls},{"member",t.member},{"isField",t.isField}});
-      G.tracks.erase(id); if(open)ImGui::TreePop(); ImGui::PopID(); continue; }
+      del.push_back(id); if(open)ImGui::TreePop(); ImGui::PopID(); continue; }
     if(open){
       if(t.isField) ImGui::TextDisabled("field track = value-change watch (1s poll)");
       ImGui::BeginChild("##tl",ImVec2(-1,240),true);
@@ -261,6 +276,7 @@ static void tabTrackers(){
     }
     ImGui::PopID();
   }
+  for(auto& d:del) G.tracks.erase(d);
   if(G.tracks.empty()) ImGui::TextDisabled("No trackers. Register from Classes tab.");
 }
 static void tabDumper(){
@@ -467,6 +483,7 @@ static void tabClasses(){
 // ---------------- frame ----------------
 void draw(){
   std::lock_guard<std::mutex> lk(G.mtx);
+  flushOpen();
   ImGuiIO& io=ImGui::GetIO();
   io.FontGlobalScale=G.cfg.fontScale;
   ImGui::SetNextWindowPos(ImVec2(8,140),ImGuiCond_FirstUseEver);

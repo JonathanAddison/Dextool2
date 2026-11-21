@@ -21,9 +21,10 @@ Java.perform(() => {
   overlay.start(app);
   function loop(m){
     try { Java.performNow(() => core.dispatch(m)); }
-    catch(e){ send({t:'toast', msg:''+e}); }
+    catch(e){ send({t:'toast', msg:''+e}); send({t:'diag', msg:'dispatch: '+e}); }
     recv('cmd', loop);
   }
   recv('cmd', loop);
-  send({t:'ready'});
+  send({t:'diag', msg:'agent ready'});
+    send({t:'ready'});
 });
