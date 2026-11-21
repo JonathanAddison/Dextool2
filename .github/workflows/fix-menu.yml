@@ -1,4 +1,4 @@
-name: stage0-smoke
+name: stage0b-native-window
 on:
   workflow_dispatch:
 permissions:
@@ -9,181 +9,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install compat layer + smoke agent + native probes
+      - name: Move ANativeWindow acquisition into native
         run: |
-          [ -f agent/index.full.js ] || cp agent/index.js agent/index.full.js
-
-          cat > agent/polyfill.js <<'EOF_POLY'
-          import { Buffer } from 'buffer';
-          globalThis.Buffer = Buffer;
-          globalThis.global = globalThis;
-          if (typeof globalThis.process === 'undefined') {
-            globalThis.process = { env:{}, platform:'android', version:'', versions:{},
-              nextTick:(f,...a)=>setTimeout(()=>f(...a),0) };
-          }
-          if (typeof globalThis.setImmediate === 'undefined') globalThis.setImmediate = (f,...a)=>setTimeout(()=>f(...a),0);
-          if (typeof globalThis.clearImmediate === 'undefined') globalThis.clearImmediate = id=>clearTimeout(id);
-          if (typeof globalThis.queueMicrotask === 'undefined') globalThis.queueMicrotask = f=>Promise.resolve().then(f);
-          if (typeof globalThis.TextEncoder === 'undefined') {
-            globalThis.TextEncoder = class TextEncoder {
-              get encoding(){ return 'utf-8'; }
-              encode(s=''){ s=String(s); const out=[];
-                for(let i=0;i<s.length;i++){ let c=s.codePointAt(i); if(c>0xffff)i++;
-                  if(c<0x80) out.push(c);
-                  else if(c<0x800) out.push(0xc0|(c>>6),0x80|(c&63));
-                  else if(c<0x10000) out.push(0xe0|(c>>12),0x80|((c>>6)&63),0x80|(c&63));
-                  else out.push(0xf0|(c>>18),0x80|((c>>12)&63),0x80|((c>>6)&63),0x80|(c&63)); }
-                return new Uint8Array(out); }
-              encodeInto(s,dst){ const b=this.encode(s); const n=Math.min(b.length,dst.length);
-                dst.set(b.subarray(0,n)); return {read:String(s).length,written:n}; }
-            };
-          }
-          if (typeof globalThis.TextDecoder === 'undefined') {
-            globalThis.TextDecoder = class TextDecoder {
-              constructor(enc='utf-8'){ this.encoding=String(enc).toLowerCase(); }
-              decode(input){ if(!input) return '';
-                const b = input instanceof ArrayBuffer ? new Uint8Array(input)
-                  : new Uint8Array(input.buffer, input.byteOffset||0, input.byteLength||input.length);
-                let s='', i=0;
-                while(i<b.length){ let c=b[i++], cp, extra;
-                  if(c<0x80){ cp=c; extra=0; }
-                  else if((c&0xe0)===0xc0){ cp=c&31; extra=1; }
-                  else if((c&0xf0)===0xe0){ cp=c&15; extra=2; }
-                  else if((c&0xf8)===0xf0){ cp=c&7; extra=3; }
-                  else { s+='\ufffd'; continue; }
-                  if(i+extra>b.length){ s+='\ufffd'; break; }
-                  let ok=true;
-                  for(let k=0;k<extra;k++){ const d=b[i++]; if((d&0xc0)!==0x80){ ok=false; break; } cp=(cp<<6)|(d&63); }
-                  if(!ok||cp>0x10ffff||(cp>=0xd800&&cp<=0xdfff)){ s+='\ufffd'; continue; }
-                  if(cp>0xffff){ cp-=0x10000; s+=String.fromCharCode(0xd800+(cp>>10),0xdc00+(cp&1023)); }
-                  else s+=String.fromCharCode(cp);
-                }
-                return s; }
-            };
-          }
-          EOF_POLY
-
-          cat > agent/index.js <<'EOF_SMOKE'
-          import './polyfill.js';
-          import Java from 'frida-java-bridge';
-
-          function D(m){ try{ send({t:'diag', msg:'SMOKE '+m}); }catch(e){} }
-          const origLog = console.log.bind(console);
-          ['log','warn','error'].forEach(k=>{
-            console[k]=(...a)=>{ const s=a.map(String).join(' '); D('console.'+k+': '+s); origLog(...a); };
-          });
-          function cmdLoop(m){
-            if(m && m.t==='ping') D('PASS native->agent roundtrip');
-            else D('cmd '+JSON.stringify(m));
-            recv('cmd',cmdLoop);
-          }
-          recv('cmd',cmdLoop);
-          D('start');
-          ['Buffer','TextEncoder','TextDecoder','setTimeout','NativeFunction','Module','Process','Interceptor','Memory']
-            .forEach(n=>D((typeof globalThis[n]!=='undefined'?'PASS global ':'FAIL global ')+n));
-
-          let tries=0, attached=false, NF=null;
-          function natives(){
-            if(NF) return NF;
-            const g=n=>Module.getExportByName('libtool.so',n);
-            NF={
-              surface:new NativeFunction(g('tool_surface'),'void',['pointer','int','int','float']),
-              resize:new NativeFunction(g('tool_surface_resize'),'void',['int','int']),
-              destroy:new NativeFunction(g('tool_surface_destroy'),'void',[]),
-              touch:new NativeFunction(g('tool_touch'),'int',['int','float','float']),
-              aw:new NativeFunction(Module.getExportByName('libandroid.so','ANativeWindow_fromSurface'),'pointer',['pointer','pointer'])
-            };
-            return NF;
-          }
-          function attach(activity){
-            if(attached) return; attached=true;
-            try{
-              Java.performNow(()=>{
-                D('attach begin');
-                const N=natives();
-                const SV=Java.use('android.view.SurfaceView');
-                const v=SV.$new(activity);
-                v.setZOrderOnTop(true);
-                v.getHolder().setFormat(Java.use('android.graphics.PixelFormat').TRANSLUCENT.value);
-                const density=activity.getResources().getDisplayMetrics().density.value;
-                const env=Java.vm.getEnv().handle;
-                const CB=Java.registerClass({
-                  name:'re.tool.SmokeCB'+Date.now(),
-                  implements:[Java.use('android.view.SurfaceHolder$Callback')],
-                  methods:{
-                    surfaceCreated(h){ try{
-                      const win=N.aw(env,h.getSurface().$h);
-                      const r=h.getSurfaceFrame();
-                      D('PASS surfaceCreated '+r.width()+'x'+r.height());
-                      N.surface(win,r.width(),r.height(),density);
-                      D('PASS tool_surface called');
-                    }catch(e){ D('FAIL surfaceCreated '+e); } },
-                    surfaceChanged(h,f,w,hh){ N.resize(w,hh); },
-                    surfaceDestroyed(h){ D('surfaceDestroyed'); N.destroy(); }
-                  }
-                });
-                v.getHolder().addCallback(CB.$new());
-                const T=Java.registerClass({
-                  name:'re.tool.SmokeTouch'+Date.now(),
-                  implements:[Java.use('android.view.View$OnTouchListener')],
-                  methods:{ onTouch(v,e){ const r=N.touch(e.getActionMasked(),e.getX(),e.getY()); return (r&1)!==0; } }
-                });
-                v.setOnTouchListener(T.$new());
-                const decor=activity.getWindow().getDecorView();
-                const VG=Java.use('android.view.ViewGroup');
-                const LP=Java.use('android.widget.FrameLayout$LayoutParams');
-                Java.cast(decor,VG).addView(v,LP.$new(-1,-1));
-                D('PASS overlay added');
-              });
-            }catch(e){ D('FAIL attach '+e); attached=false; }
-          }
-          function init(){
-            try{
-              Java.perform(()=>{
-                try{
-                  const app=Java.use('android.app.ActivityThread').currentApplication();
-                  if(app===null){ if(tries++<60) D('app null retry '+tries); setTimeout(init,250); return; }
-                  D('PASS Java.perform + app');
-                  const ctx=app.getApplicationContext();
-                  const File=Java.use('java.io.File');
-                  const dir=File.$new(ctx.getExternalFilesDir(null),'tool'); dir.mkdirs();
-                  const Build=Java.use('android.os.Build$VERSION');
-                  send({t:'paths', dir:dir.getAbsolutePath(), pkg:ctx.getPackageName(), sdk:Build.SDK_INT.value});
-                  D('PASS Java.use Build sdk='+Build.SDK_INT.value);
-                  const R=Java.registerClass({
-                    name:'re.tool.SmokeRunnable'+Date.now(),
-                    implements:[Java.use('java.lang.Runnable')],
-                    methods:{ run(){ D('PASS registerClass Runnable.run invoked'); } }
-                  });
-                  const r=R.$new();
-                  D('PASS registerClass created');
-                  r.run();
-                  const LC=Java.registerClass({
-                    name:'re.tool.SmokeLC'+Date.now(),
-                    implements:[Java.use('android.app.Application$ActivityLifecycleCallbacks')],
-                    methods:{
-                      onActivityCreated(a,b){}, onActivityStarted(a){},
-                      onActivityResumed(a){ D('onActivityResumed'); attach(a); },
-                      onActivityPaused(a){}, onActivityStopped(a){},
-                      onActivitySaveInstanceState(a,b){}, onActivityDestroyed(a){}
-                    }
-                  });
-                  app.registerActivityLifecycleCallbacks(LC.$new());
-                  D('PASS lifecycle registered');
-                  try{
-                    const at=Java.use('android.app.ActivityThread').currentActivityThread();
-                    const it=at.mActivities.value.values().iterator();
-                    while(it.hasNext()){ const rec=it.next(); const a=rec.activity.value;
-                      if(a!==null&&!a.isFinishing()){ attach(a); break; } }
-                  }catch(e){ D('current activity lookup skip: '+e); }
-                  D('READY'); send({t:'ready'});
-                }catch(e){ D('FAIL init '+e+' | '+(e.stack||'')); setTimeout(init,500); }
-              });
-            }catch(e){ D('FAIL perform '+e); setTimeout(init,500); }
-          }
-          init();
-          EOF_SMOKE
-
           python3 - <<'PY'
           import sys
           def rep(path,old,new):
@@ -194,32 +21,57 @@ jobs:
                   print('already',path)
               else:
                   print('MISS',path,repr(old[:70])); sys.exit(1)
-          # native->agent ping for roundtrip probe
-          rep('native/main.cpp','static void gumThread(){',
-              'static gboolean sendPing(gpointer){\n  if(g_script) gum_script_post(g_script,"{\\"type\\":\\"cmd\\",\\"t\\":\\"ping\\"}",nullptr);\n  return G_SOURCE_REMOVE;\n}\nstatic void gumThread(){')
-          rep('native/main.cpp','diag::log("script loaded");\n  g_main_loop_run(loop);',
-              'diag::log("script loaded");\n  g_timeout_add(1500,sendPing,nullptr);\n  g_main_loop_run(loop);')
-          # renderer probes
-          rep('native/renderer.cpp','eglMakeCurrent(dpy,surf,surf,ctx);',
-              'eglMakeCurrent(dpy,surf,surf,ctx);\n  diag::log("egl makeCurrent ok");')
-          rep('native/renderer.cpp','ImGui::Render();',
-              'ImGui::Render();\n    { static bool ff=false; if(!ff){ ff=true; diag::log("SMOKE PASS first ImGui frame"); } }')
-          # stop publish retry spam after first successful public publish
-          rep('native/diag.cpp','static bool g_diagPub=false;',
-              'static bool g_diagPub=false;\nstatic bool g_pubDone=false;')
-          rep('native/diag.cpp','for(int i=0;i<8;i++){ usleep(i==0?1500000:5000000); publishAll(); }',
-              'for(int i=0;i<8 && !g_pubDone;i++){ usleep(i==0?1500000:5000000); publishAll(); }')
-          rep('native/diag.cpp','if(base=="diag.log") g_diagPub=true;',
-              'if(base=="diag.log"){ g_diagPub=true; g_pubDone=true; }')
-          rep('native/diag.cpp','if(!g_diagPub){ publishOne(env,resolver,dUri,cvCls,cvInit,put,insert,openOS,write,close,diagp,false); g_diagPub=true; }',
-              'if(!g_diagPub){ publishOne(env,resolver,dUri,cvCls,cvInit,put,insert,openOS,write,close,diagp,false); g_diagPub=true; g_pubDone=true; }')
-          print('NATIVE PROBES OK')
-          PY
 
+          rep('native/diag.h','void init(JavaVM* vm);','void init(JavaVM* vm);\n  JavaVM* vm();')
+          rep('native/diag.cpp','std::string dir(){ return g_dir; }',
+              'std::string dir(){ return g_dir; }\nJavaVM* vm(){ return g_vm; }')
+          rep('native/exports.map','tool_surface;','tool_surface; tool_surface_from_java;')
+
+          newfn='''extern "C" __attribute__((visibility("default")))
+          void tool_surface_from_java(void* surface,int w,int h,float density){
+            diag::log("tool_surface_from_java surface=%p %dx%d d=%.2f",surface,w,h,density);
+            JavaVM* vm=diag::vm();
+            if(!vm){ diag::log("FAIL no JavaVM"); return; }
+            JNIEnv* env=nullptr;
+            if(vm->GetEnv((void**)&env,JNI_VERSION_1_6)!=0||!env){ diag::log("FAIL GetEnv"); return; }
+            ANativeWindow* win=ANativeWindow_fromSurface(env,(jobject)surface);
+            if(!win){ diag::log("FAIL ANativeWindow_fromSurface null"); return; }
+            diag::log("ANativeWindow=%p",win);
+            tool_surface(win,w,h,density);
+          }
+          '''
+          rep('native/renderer.cpp',
+              'extern "C" __attribute__((visibility("default")))\nvoid tool_surface_resize(int w,int h){',
+              newfn+'extern "C" __attribute__((visibility("default")))\nvoid tool_surface_resize(int w,int h){')
+
+          # smoke agent: use native helper + granular probes
+          rep('agent/index.js',
+              "surface:new NativeFunction(g('tool_surface'),'void',['pointer','int','int','float']),",
+              "surface:new NativeFunction(g('tool_surface'),'void',['pointer','int','int','float']),\n              surfaceJava:new NativeFunction(g('tool_surface_from_java'),'void',['pointer','int','int','float']),")
+          old="""surfaceCreated(h){ try{
+                      const win=N.aw(env,h.getSurface().$h);
+                      const r=h.getSurfaceFrame();
+                      D('PASS surfaceCreated '+r.width()+'x'+r.height());
+                      N.surface(win,r.width(),r.height(),density);
+                      D('PASS tool_surface called');
+                    }catch(e){ D('FAIL surfaceCreated '+e); } },"""
+          new="""surfaceCreated(h){ try{
+                      D('sc: getSurface');
+                      const s=h.getSurface();
+                      if(s.$h===undefined||s.$h===null){ D('FAIL surface handle missing'); return; }
+                      D('sc: surface handle='+s.$h);
+                      const r=h.getSurfaceFrame();
+                      D('sc: frame '+r.width()+'x'+r.height());
+                      N.surfaceJava(s.$h,r.width(),r.height(),density);
+                      D('PASS tool_surface called');
+                    }catch(e){ D('FAIL surfaceCreated '+e); } },"""
+          rep('agent/index.js',old,new)
+          print('PATCHES OK')
+          PY
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add agent native
-          git diff --cached --quiet || { git commit -m "stage0 smoke: compat layer + capability probes [skip ci]"; git push; }
+          git add native agent
+          git diff --cached --quiet || { git commit -m "stage0b: acquire ANativeWindow in native via stored JavaVM [skip ci]"; git push; }
 
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
@@ -227,7 +79,7 @@ jobs:
         id: ndk
         with: { ndk-version: r26d }
 
-      - name: Bundle smoke agent + strict verify
+      - name: Bundle smoke agent + verify
         run: |
           npm init -y >/dev/null
           node -e "const p=require('./package.json');p.type='module';require('fs').writeFileSync('package.json',JSON.stringify(p,null,2))"
@@ -304,7 +156,7 @@ jobs:
       - name: Upload clean artifact (3 files only)
         uses: actions/upload-artifact@v4
         with:
-          name: libtool-stage0
+          name: libtool-stage0b
           path: |
             out/tooltest.apk
             out/libtool-arm64-v8a.so
