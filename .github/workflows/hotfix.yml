@@ -1,4 +1,4 @@
-name: final-build2
+name: final-build3
 on:
   workflow_dispatch:
 permissions:
@@ -9,34 +9,65 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fix test app lambda (no LambdaMetafactory needed)
+      - name: Rewrite test app without inner classes
         run: |
-          python3 - <<'PY'
-          import sys
-          p='testapp/src/com/example/tooltest/MainActivity.java'
-          s=open(p,encoding='utf-8').read()
-          old='btn.setOnClickListener(v -> { out.setText(greet(e.getText().toString(), add(2,3))); logIt(out.getText().toString()); });'
-          new='''btn.setOnClickListener(new android.view.View.OnClickListener(){
-                @Override public void onClick(android.view.View v){
-                  out.setText(greet(e.getText().toString(), add(2,3)));
-                  logIt(out.getText().toString());
-                }
-              });'''
-          if old in s:
-              s=s.replace(old,new,1); print('patched lambda -> anonymous class')
-          elif 'new android.view.View.OnClickListener' in s:
-              print('already patched')
-          else:
-              print('MISS lambda line'); sys.exit(1)
-          s=s.replace('EditText e = new EditText(this);','final EditText e = new EditText(this);')
-          s=s.replace('TextView out = new TextView(this);','final TextView out = new TextView(this);')
-          open(p,'w',encoding='utf-8').write(s)
-          print('JAVA FIX OK')
-          PY
+          cat > testapp/src/com/example/tooltest/MainActivity.java <<'EOF_JAVA'
+          package com.example.tooltest;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity implements View.OnClickListener {
+              public static String secret = "hello-static";
+              private int counter = 0;
+              private EditText input;
+              private TextView output;
+
+              static { System.loadLibrary("tool"); }
+
+              public String greet(String who, int times) {
+                  counter++;
+                  return "Hi " + who + " x" + times + " (#" + counter + ")";
+              }
+
+              public int add(int a, int b) { return a + b; }
+
+              public void logIt(String s) { android.util.Log.i("ToolTest", s); }
+
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  LinearLayout l = new LinearLayout(this);
+                  l.setOrientation(LinearLayout.VERTICAL);
+                  TextView t = new TextView(this);
+                  t.setText("libtool test app - tap TOOL button");
+                  input = new EditText(this);
+                  input.setHint("name");
+                  Button btn = new Button(this);
+                  btn.setText("Call greet()");
+                  output = new TextView(this);
+                  btn.setOnClickListener(this);
+                  l.addView(t);
+                  l.addView(input);
+                  l.addView(btn);
+                  l.addView(output);
+                  setContentView(l);
+              }
+
+              @Override public void onClick(View v) {
+                  output.setText(greet(input.getText().toString(), add(2, 3)));
+                  logIt(output.getText().toString());
+              }
+          }
+          EOF_JAVA
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git diff --cached --quiet || { git commit -m "test app: avoid lambda for javac bootclasspath [skip ci]"; git push; }
+          git diff --cached --quiet || { git commit -m "test app: no inner classes; newer d8 [skip ci]"; git push; }
 
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
@@ -94,10 +125,10 @@ jobs:
           name: libtool-libs
           path: out/libs/**
 
-      - name: Build test APK (stable SDK + anonymous class)
+      - name: Build test APK (no inner classes, newer d8, -g)
         run: |
           set -e
-          pick_bt(){ for v in 34.0.0 35.0.0 36.0.0; do [ -d "$ANDROID_HOME/build-tools/$v" ] && { echo "$ANDROID_HOME/build-tools/$v"; return; }; done; ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1; }
+          pick_bt(){ for v in 36.0.0 35.0.0 34.0.0; do [ -d "$ANDROID_HOME/build-tools/$v" ] && { echo "$ANDROID_HOME/build-tools/$v"; return; }; done; ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1; }
           pick_pj(){ for v in 34 35 36; do [ -f "$ANDROID_HOME/platforms/android-$v/android.jar" ] && { echo "$ANDROID_HOME/platforms/android-$v/android.jar"; return; }; done; ls -d "$ANDROID_HOME"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1; }
           BT=$(pick_bt); PJ=$(pick_pj)
           [ -n "$BT" ] && [ -n "$PJ" ] || { echo "No Android SDK found"; exit 1; }
@@ -105,7 +136,7 @@ jobs:
           mkdir -p build/apk/obj
           "$BT/aapt2" link --manifest testapp/AndroidManifest.xml -I "$PJ" \
             --min-sdk-version 26 --target-sdk-version 34 -o build/apk/base.apk
-          javac -nowarn -source 8 -target 8 -bootclasspath "$PJ" -d build/apk/obj \
+          javac -g -nowarn -source 8 -target 8 -bootclasspath "$PJ" -d build/apk/obj \
             testapp/src/com/example/tooltest/MainActivity.java
           "$BT/d8" --release --min-api 26 --lib "$PJ" --output build/apk $(find build/apk/obj -name '*.class')
           (cd build/apk && zip -j base.apk classes.dex)
