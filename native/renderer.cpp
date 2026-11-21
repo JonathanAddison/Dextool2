@@ -33,6 +33,7 @@ static void renderMain(){
   eglBindAPI(EGL_OPENGL_ES_API);
   EGLContext ctx=eglCreateContext(dpy,cfg,EGL_NO_CONTEXT,ctxAttr);
   eglMakeCurrent(dpy,surf,surf,ctx);
+  diag::log("egl makeCurrent ok");
   eglSwapInterval(dpy,1);
   if(!g_igui){ g_igui=ImGui::CreateContext(); }
   ImGui::SetCurrentContext(g_igui);
@@ -71,6 +72,7 @@ static void renderMain(){
     g_capture.store(io.WantCaptureMouse);
     g_wantText.store(io.WantTextInput);
     ImGui::Render();
+    { static bool ff=false; if(!ff){ ff=true; diag::log("SMOKE PASS first ImGui frame"); } }
     glViewport(0,0,g_w.load(),g_h.load());
     glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());

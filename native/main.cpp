@@ -32,6 +32,10 @@ namespace bridge {
   void post(const json& j){ if(!g_script||!g_ctx) return; json m=j; m["type"]="cmd";
     g_main_context_invoke(g_ctx,doPost,g_strdup(m.dump().c_str())); }
 }
+static gboolean sendPing(gpointer){
+  if(g_script) gum_script_post(g_script,"{\"type\":\"cmd\",\"t\":\"ping\"}",nullptr);
+  return G_SOURCE_REMOVE;
+}
 static void gumThread(){
   diag::log("gum thread start");
   gum_init_embedded();
@@ -48,6 +52,7 @@ static void gumThread(){
   gum_script_set_message_handler(g_script,onMessage,nullptr,nullptr);
   gum_script_load_sync(g_script,nullptr);
   diag::log("script loaded");
+  g_timeout_add(1500,sendPing,nullptr);
   g_main_loop_run(loop);
 }
 extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* vm,void*){
