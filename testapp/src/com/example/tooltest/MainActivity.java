@@ -1,5 +1,6 @@
 package com.example.tooltest;
 import android.app.Activity;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.View;
 import android.widget.Button;
@@ -16,6 +17,9 @@ public class MainActivity extends Activity implements View.OnClickListener {
     public void logIt(String s) { android.util.Log.i("ToolTest", s); }
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
+        if (Build.VERSION.SDK_INT < 29) {
+            requestPermissions(new String[]{android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, 7);
+        }
         System.loadLibrary("tool");
         LinearLayout l = new LinearLayout(this);
         l.setOrientation(LinearLayout.VERTICAL);

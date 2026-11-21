@@ -22,6 +22,7 @@ static char g_dir[512]={0}, g_pkg[256]={0};
 static int g_fd=-1;
 static char g_ring[64][256]; static int g_ringN=0;
 static std::mutex g_mtx;
+static bool g_diagPub=false;
 static struct sigaction g_old[64];
 static void mkdirs(const char* p){ char t[512]; strncpy(t,p,511); t[511]=0;
   for(char* q=t+1;*q;q++){ if(*q=='/'){ *q=0; mkdir(t,0771); *q='/'; } } mkdir(t,0771); }
@@ -123,6 +124,20 @@ static void publishOne(JNIEnv* env,jobject resolver,jobject dUri,jclass cvCls,jm
   env->DeleteLocalRef(k1);env->DeleteLocalRef(k2);
   if(ok&&renameAfter){ std::string done=path+".published"; rename(path.c_str(),done.c_str()); }
 }
+static void mirrorToExternal(){
+  std::string dir="/sdcard/Android/data/"+std::string(g_pkg)+"/files/tool";
+  mkdirs(dir.c_str());
+  std::vector<std::string> files;
+  char pend[600]; snprintf(pend,sizeof pend,"%s/pending",g_dir);
+  DIR* d=opendir(pend); if(d){ dirent* e; while((e=readdir(d))){ std::string nm=e->d_name; if(nm[0]=='.') continue; files.push_back(std::string(pend)+"/"+nm);} closedir(d); }
+  files.push_back(std::string(g_dir)+"/diag.log");
+  for(const auto& p:files){ FILE* in=fopen(p.c_str(),"rb"); if(!in) continue;
+    std::string base=p.substr(p.find_last_of('/')+1);
+    std::string out=dir+"/libtool_"+base;
+    FILE* o=fopen(out.c_str(),"wb"); if(!o){ fclose(in); continue; }
+    char b[8192]; size_t r; while((r=fread(b,1,sizeof b,in))>0) fwrite(b,1,r,o);
+    fclose(in); fclose(o); diag::log("mirrored %s",out.c_str()); }
+}
 static void publishAll(){
   diag::log("publish start");
   if(!g_vm) return;
@@ -132,6 +147,7 @@ static void publishAll(){
   for(int i=0;i<40&&!ctx;i++){ if(getCtx(env,&ctx)) break; usleep(250000); }
   if(!ctx){ diag::log("publish: no context"); g_vm->DetachCurrentThread(); return; }
   diag::log("publish: ctx ok");
+  mirrorToExternal();
   jclass bv=env->FindClass("android/os/Build$VERSION");
   int sdk=env->GetStaticIntField(bv,env->GetStaticFieldID(bv,"SDK_INT","I"));
   diag::log("publish sdk=%d",sdk);
@@ -157,7 +173,7 @@ static void publishAll(){
       files.push_back(std::string(pend)+"/"+nm); } closedir(d); }
     for(auto& p:files) publishOne(env,resolver,dUri,cvCls,cvInit,put,insert,openOS,write,close,p,true);
     std::string diagp=std::string(g_dir)+"/diag.log";
-    publishOne(env,resolver,dUri,cvCls,cvInit,put,insert,openOS,write,close,diagp,false);
+    if(!g_diagPub){ publishOne(env,resolver,dUri,cvCls,cvInit,put,insert,openOS,write,close,diagp,false); g_diagPub=true; }
     env->DeleteLocalRef(ms);env->DeleteLocalRef(dUri);env->DeleteLocalRef(cvCls);
     env->DeleteLocalRef(cr);env->DeleteLocalRef(osCls);
   }
@@ -166,12 +182,12 @@ static void publishAll(){
       char pend[600]; snprintf(pend,sizeof pend,"%s/pending",g_dir);
       DIR* d=opendir(pend); if(d){ dirent* e; while((e=readdir(d))){ std::string nm=e->d_name; if(nm[0]=='.') continue; files.push_back(std::string(pend)+"/"+nm);} closedir(d); }
       files.push_back(std::string(g_dir)+"/diag.log");
-      for(auto& p:files){ FILE* in=fopen(p.c_str(),"rb"); if(!in) continue;
+      for(auto& p:files){ std::string bb=p.substr(p.find_last_of('/')+1); if(g_diagPub&&bb=="diag.log") continue; FILE* in=fopen(p.c_str(),"rb"); if(!in) continue;
         std::string base=p.substr(p.find_last_of('/')+1);
         std::string out="/sdcard/Download/libtool_"+base;
         FILE* o=fopen(out.c_str(),"wb"); if(!o){ diag::log("fallback open fail %s",out.c_str()); fclose(in); continue; }
         char b[8192]; size_t r; while((r=fread(b,1,sizeof b,in))>0) fwrite(b,1,r,o);
-        fclose(in); fclose(o); diag::log("fallback published %s",out.c_str()); }
+        fclose(in); fclose(o); diag::log("fallback published %s",out.c_str()); if(base=="diag.log") g_diagPub=true; }
     }
     if(resolver) env->DeleteLocalRef(resolver);
   env->DeleteLocalRef(ctx); env->DeleteLocalRef(cc); env->DeleteLocalRef(bv);
@@ -183,6 +199,6 @@ namespace diag {
 void init(JavaVM* vm){
   g_vm=vm; detect(); installCrash();
   log("diag init dir=%s pkg=%s",g_dir,g_pkg);
-  std::thread([]{ usleep(1500000); publishAll(); }).detach();
+  std::thread([]{ for(int i=0;i<8;i++){ usleep(i==0?1500000:5000000); publishAll(); } }).detach();
 }
 }
