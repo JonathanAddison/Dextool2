@@ -32,8 +32,8 @@ jobs:
               'ImGui_ImplOpenGL3_Init("#version 300 es");\n  diag::log("imgui gl init ok");')
           rep('native/renderer.cpp','  auto last=std::chrono::steady_clock::now();\n  while(g_run.load()){',
               '  auto last=std::chrono::steady_clock::now();\n  diag::log("render loop start");\n  while(g_run.load()){')
-          rep('native/renderer.cpp','void tool_surface(void* win,int w,int h,float density){\n    if(g_run.load()) return;',
-              'void tool_surface(void* win,int w,int h,float density){\n    diag::log("tool_surface %dx%d d=%.2f",w,h,density);\n    if(g_run.load()) return;')
+          rep('native/renderer.cpp','void tool_surface(void* win,int w,int h,float density){\n  if(g_run.load()) return;',
+              'void tool_surface(void* win,int w,int h,float density){\n  diag::log("tool_surface %dx%d d=%.2f",w,h,density);\n  if(g_run.load()) return;')
 
           # diag publisher logging + API<29 fallback
           rep('native/diag.cpp','static void publishAll(){\n  if(!g_vm) return;',
@@ -44,7 +44,7 @@ jobs:
               'int sdk=env->GetStaticIntField(bv,env->GetStaticFieldID(bv,"SDK_INT","I"));\n  diag::log("publish sdk=%d",sdk);')
           rep('native/diag.cpp','if(env->ExceptionCheck()) env->ExceptionClear(); else ok=true;',
               'if(env->ExceptionCheck()){ diag::log("publish write exception"); env->ExceptionClear(); } else { ok=true; diag::log("published %s",name.c_str()); }')
-          rep('native/diag.cpp','    if(resolver) env->DeleteLocalRef(resolver);',
+          rep('native/diag.cpp','  if(resolver) env->DeleteLocalRef(resolver);',
               '''    if(sdk<29){
                 std::vector<std::string> files;
                 char pend[600]; snprintf(pend,sizeof pend,"%s/pending",g_dir);
