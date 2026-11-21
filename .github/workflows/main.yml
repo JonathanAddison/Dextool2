@@ -1,0 +1,1769 @@
+name: libtool-build
+on:
+  workflow_dispatch:
+    inputs:
+      frida_version:
+        description: "Frida gumjs devkit version"
+        default: "16.7.19"
+  push:
+    paths: [".github/workflows/tool.yml", "native/**", "agent/**", "CMakeLists.txt"]
+permissions:
+  contents: write
+env:
+  FRIDA_VERSION: ${{ inputs.frida_version || '16.7.19' }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ============================================================
+      # 1) WRITE PROJECT SOURCES (only on first run; then editable)
+      # ============================================================
+      - name: Generate build files
+        run: |
+          [ -f CMakeLists.txt ] && exit 0
+          cat > CMakeLists.txt <<'EOF_CMAKE'
+          cmake_minimum_required(VERSION 3.22)
+          project(tool C CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+          add_library(tool SHARED
+            native/main.cpp native/renderer.cpp native/ui.cpp
+            ${IMGUI_DIR}/imgui.cpp ${IMGUI_DIR}/imgui_draw.cpp
+            ${IMGUI_DIR}/imgui_tables.cpp ${IMGUI_DIR}/imgui_widgets.cpp
+            ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+            ${IMGUI_DIR}/misc/cpp/imgui_stdlib.cpp)
+          target_include_directories(tool PRIVATE
+            native ${GUM_DIR} ${IMGUI_DIR} ${IMGUI_DIR}/backends
+            ${IMGUI_DIR}/misc/cpp ${JSON_DIR} ${GEN_DIR})
+          target_compile_definitions(tool PRIVATE IMGUI_IMPL_OPENGL_ES3)
+          target_compile_options(tool PRIVATE -ffunction-sections -fdata-sections -fvisibility=hidden -O2)
+          target_link_options(tool PRIVATE
+            -Wl,--gc-sections -Wl,--exclude-libs,ALL -s
+            -Wl,--version-script=${CMAKE_SOURCE_DIR}/native/exports.map)
+          target_link_libraries(tool PRIVATE
+            ${GUM_DIR}/libfrida-gumjs.a EGL GLESv3 android log dl m)
+          EOF_CMAKE
+          mkdir -p native
+          cat > native/exports.map <<'EOF_MAP'
+          { global: JNI_OnLoad; tool_surface; tool_surface_resize; tool_surface_destroy; tool_touch; tool_text; tool_special; local: *; };
+          EOF_MAP
+
+      - name: Generate native state.h
+        run: |
+          [ -f native/state.h ] && exit 0
+          cat > native/state.h <<'EOF_STATE'
+          #pragma once
+          #include <string>
+          #include <vector>
+          #include <map>
+          #include <deque>
+          #include <mutex>
+          #include <atomic>
+          #include <nlohmann/json.hpp>
+          using json = nlohmann::json;
+
+          // ---- wire value encoding: {k:"skip"|"null"|"prim"|"str"|"obj", v?, h?}
+          struct MethodInfo { std::string n, mods, ret; std::vector<std::string> p; bool st=false; int ov=-1; };
+          struct FieldInfo  { std::string n, mods, t, v; bool st=false; };
+          struct InstanceInfo { long long h=0; std::string label; };
+          struct StackFrame { std::string c, s; };
+          struct LogEntry { std::string text, cls; std::vector<StackFrame> stack; json raw; };
+          struct PatchRec { std::string id, cls, member, type, retType; bool isField=false, enabled=true, lock=false;
+                            int ov=-1; std::vector<std::string> params; std::vector<json> args; json ret; };
+          struct HookRec  { std::string id, cls, name, mode="java", code, ret; bool enabled=true; int ov=-1;
+                            std::vector<std::string> params; };
+          struct TrackRec { std::string id, cls, member; bool isField=false, enabled=true; std::deque<LogEntry> log; };
+
+          struct ArgEditor {
+            std::vector<std::string> types; std::vector<json> vals;
+            int popupFor=-1; std::vector<InstanceInfo> results; bool busy=false;
+            void init(const std::vector<std::string>& t, bool patchMode){
+              types=t; vals.assign(t.size(), json{{"k", patchMode?"skip":"prim"},{"v",""}});
+              for(size_t i=0;i<t.size();i++) if(!isText(t[i])) vals[i]=json{{"k","null"}};
+            }
+            static bool isText(const std::string& t){
+              return t=="int"||t=="long"||t=="short"||t=="byte"||t=="float"||t=="double"
+                  ||t=="boolean"||t=="char"||t=="java.lang.String"||t=="java.lang.CharSequence";
+            }
+          };
+          struct MemberUI {
+            bool call=false, patch=false, track=false, hook=false;
+            ArgEditor callArgs, patchArgs; json patchRet=json{{"k","skip"},{"v",""}}; bool patchRetOn=false;
+            std::string hookMode="java", hookCode, callResult, fieldVal; bool fieldLock=false, fieldTrack=false;
+            std::deque<LogEntry> callLog;
+          };
+          struct ClassWindow {
+            int id=0; bool isList=true, open=true, loaded=false, searching=false;
+            std::string title="Classes", cls; long long handle=0;
+            char filter[256]={0}; int mode=0, sub=0;
+            std::vector<std::string> results;
+            char mfilter[256]={0};
+            std::vector<MethodInfo> methods; std::vector<FieldInfo> fields; json ctors=json::array();
+            bool instPanel=false, creating=false; int ctorSel=0; ArgEditor ctorArgs;
+            std::vector<InstanceInfo> instances;
+            std::map<std::string, MemberUI> mu;
+          };
+          struct Settings {
+            float fontScale=1.0f, opacity=0.95f; int theme=0, logCap=2000;
+            bool publishDownloads=true, crashHandler=true;
+            std::string dir, pkg; int sdk=0;
+          };
+          struct AppState {
+            std::mutex mtx;
+            std::vector<ClassWindow> wins; int activeWin=-1, nextWin=1, nextReq=1;
+            std::map<std::string, PatchRec> patches;
+            std::map<std::string, HookRec> hooks;
+            std::map<std::string, TrackRec> tracks;
+            std::deque<LogEntry> recordLog, monitorLog, scriptLog;
+            std::vector<std::pair<std::string,long long>> dumped;
+            std::deque<std::pair<std::string,float>> toasts;
+            Settings cfg; bool menuOpen=false, recorderOn=false, monitorOn=false;
+            char scriptBuf[65536]={0}; char recScope[256]={0};
+            int monitorDetail=-1;
+          };
+          inline AppState G;
+
+          namespace ui { void draw(); void openClass(const std::string& cls, long long h=0);
+                         void toast(const std::string& s); void route(const json& j); }
+          namespace bridge { void post(const json& j); }
+          EOF_STATE
+
+      - name: Generate native main.cpp (JNI + gum bridge + crash)
+        run: |
+          [ -f native/main.cpp ] && exit 0
+          cat > native/main.cpp <<'EOF_MAIN'
+          #include "state.h"
+          #include <frida-gumjs.h>
+          #include <jni.h>
+          #include <android/log.h>
+          #include <agent_js.h>
+          #include <thread>
+          #include <fstream>
+          #include <sstream>
+          #include <csignal>
+          #include <cstring>
+          #include <unwind.h>
+          #include <dlfcn.h>
+          #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,"libtool",__VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR,"libtool",__VA_ARGS__)
+
+          static GumScript* g_script=nullptr; static GMainContext* g_ctx=nullptr;
+          static std::string g_dir;
+
+          // ---------- crash handler ----------
+          struct BtState { void** cur; void** end; };
+          static _Unwind_Reason_Code btCb(_Unwind_Context* c, void* p){
+            BtState* s=(BtState*)p; void* pc=(void*)_Unwind_GetIP(c);
+            if(s->cur<s->end) *s->cur++=pc; return _URC_NO_REASON;
+          }
+          static struct sigaction g_old[64];
+          static void crashHandler(int sig, siginfo_t* si, void*){
+            LOGE("crash signal %d addr %p", sig, si->si_addr);
+            if(!g_dir.empty()){
+              char path[512]; snprintf(path,sizeof path,"%s/crash_%ld.txt",g_dir.c_str(),(long)time(nullptr));
+              FILE* f=fopen(path,"w");
+              if(f){
+                fprintf(f,"signal %d fault %p\n",sig,si->si_addr);
+                void* bt[64]; BtState s{bt,bt+64}; _Unwind_Backtrace(btCb,&s);
+                for(void** p=bt;p<s.cur;p++){ Dl_info di; if(dladdr(*p,&di))
+                  fprintf(f,"%s (%s+0x%lx)\n",di.dli_fname,di.dli_sname?di.dli_sname:"?",
+                          (unsigned long)((char*)*p-(char*)di.dli_saddr)); else fprintf(f,"%p\n",*p); }
+                fclose(f);
+              }
+            }
+            sigaction(sig,&g_old[sig],nullptr); raise(sig);
+          }
+          static void installCrash(){
+            struct sigaction sa{}; sa.sa_sigaction=crashHandler; sa.sa_flags=SA_SIGINFO|SA_RESETHAND;
+            for(int s:{SIGSEGV,SIGABRT,SIGBUS,SIGFPE,SIGILL}) sigaction(s,&sa,&g_old[s]);
+          }
+
+          // ---------- agent message sink ----------
+          static void onMessage(GumScript*, const gchar* msg, GBytes* data, gpointer){
+            json j; try{ j=json::parse(msg); }catch(...){
+              std::lock_guard<std::mutex> lk(G.mtx);
+              G.scriptLog.push_back({msg?msg:"(bad json)","",{},{}}); return;
+            }
+            if(data && j.value("t","")=="dex"){
+              gsize n=0; gconstpointer p=g_bytes_get_data(data,&n);
+              std::string name=j.value("name","classes.dex");
+              std::string path=g_dir.empty()?("/data/local/tmp/"+name):(g_dir+"/"+name);
+              FILE* f=fopen(path.c_str(),"wb"); if(f){ fwrite(p,1,n,f); fclose(f); }
+              std::lock_guard<std::mutex> lk(G.mtx);
+              G.dumped.push_back({path,(long long)n}); ui::toast("dumped "+path);
+              return;
+            }
+            ui::route(j);
+          }
+          static gboolean doPost(gpointer p){
+            char* s=(char*)p;
+          #ifdef GUM_POST_NO_DATA
+            gum_script_post(g_script,s);
+          #else
+            gum_script_post(g_script,s,nullptr);
+          #endif
+            g_free(s); return G_SOURCE_REMOVE;
+          }
+          namespace bridge {
+            void post(const json& j){
+              if(!g_script||!g_ctx) return;
+              json m=j; m["type"]="cmd";
+              g_main_context_invoke(g_ctx,doPost,g_strdup(m.dump().c_str()));
+            }
+          }
+          static void gumThread(){
+            gum_init_embedded();
+            g_ctx=g_main_context_new(); g_main_context_push_thread_default(g_ctx);
+            GMainLoop* loop=g_main_loop_new(g_ctx,FALSE);
+            GumScriptBackend* be=gum_script_backend_obtain_qjs();
+            GError* err=nullptr;
+            std::string src((const char*)agent_js,agent_js_len);
+          #ifdef GUM_CREATE_NO_SNAPSHOT
+            g_script=gum_script_backend_create_sync(be,"tool",src.c_str(),nullptr,&err);
+          #else
+            g_script=gum_script_backend_create_sync(be,"tool",src.c_str(),nullptr,nullptr,&err);
+          #endif
+            if(err){ LOGE("script create: %s",err->message); return; }
+            gum_script_set_message_handler(g_script,onMessage,nullptr,nullptr);
+            gum_script_load_sync(g_script,nullptr,&err);
+            if(err){ LOGE("script load: %s",err->message); return; }
+            LOGI("agent loaded");
+            g_main_loop_run(loop);
+          }
+          extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM*, void*){
+            LOGI("libtool starting");
+            installCrash();
+            std::thread(gumThread).detach();
+            return JNI_VERSION_1_6;
+          }
+          // settings persistence + dir used by crash handler
+          void toolSetDir(const std::string& d){ g_dir=d; }
+          EOF_MAIN
+
+      - name: Generate native renderer.cpp (EGL + ImGui on app Surface)
+        run: |
+          [ -f native/renderer.cpp ] && exit 0
+          cat > native/renderer.cpp <<'EOF_REND'
+          #include "state.h"
+          #include <imgui.h>
+          #include <imgui_impl_opengl3.h>
+          #include <android/native_window.h>
+          #include <android/native_window_jni.h>
+          #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
+          #include <thread>
+          #include <chrono>
+          struct TouchEv { int a; float x,y; };
+          static std::atomic<ANativeWindow*> g_win{nullptr};
+          static std::atomic<int> g_w{0}, g_h{0};
+          static std::atomic<float> g_density{2.0f};
+          static std::atomic<bool> g_run{false}, g_capture{false}, g_wantText{false};
+          static std::mutex g_evMtx; static std::vector<TouchEv> g_ev;
+          static std::string g_text; static std::vector<int> g_special;
+          static std::thread g_thr;
+          static ImGuiContext* g_igui=nullptr;
+
+          static void renderMain(){
+            ANativeWindow* win=g_win.load();
+            EGLDisplay dpy=eglGetDisplay(EGL_DEFAULT_DISPLAY);
+            eglInitialize(dpy,nullptr,nullptr);
+            const EGLint cfgAttr[]={EGL_SURFACE_TYPE,EGL_WINDOW_BIT,EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT,
+              EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_ALPHA_SIZE,8,EGL_NONE};
+            EGLConfig cfg; EGLint n=0;
+            eglChooseConfig(dpy,cfgAttr,&cfg,1,&n);
+            if(!n){ ANativeWindow_release(win); return; }
+            EGLSurface surf=eglCreateWindowSurface(dpy,cfg,win,nullptr);
+            const EGLint ctxAttr[]={EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE};
+            eglBindAPI(EGL_OPENGL_ES_API);
+            EGLContext ctx=eglCreateContext(dpy,cfg,EGL_NO_CONTEXT,ctxAttr);
+            eglMakeCurrent(dpy,surf,surf,ctx);
+            eglSwapInterval(dpy,1);
+            if(!g_igui){ g_igui=ImGui::CreateContext(); }
+            ImGui::SetCurrentContext(g_igui);
+            ImGuiIO& io=ImGui::GetIO();
+            float d=g_density.load();
+            ImFontConfig fc; fc.OversampleH=2;
+            if(io.Fonts->Fonts.empty())
+              io.Fonts->AddFontFromFileTTF("/system/fonts/Roboto-Regular.ttf",16.0f*d,&fc);
+            ImGui::StyleColorsDark();
+            ImGui::GetStyle().ScaleAllSizes(d*0.9f);
+            ImGui_ImplOpenGL3_Init("#version 300 es");
+            auto last=std::chrono::steady_clock::now();
+            while(g_run.load()){
+              { std::lock_guard<std::mutex> lk(g_evMtx);
+                for(auto& e:g_ev){
+                  ImGui_ImplOpenGL3_NewFrame(); // no-op cost; keep io current below
+                  io.AddMousePosEvent(e.x,e.y);
+                  if(e.a==0) io.AddMouseButtonEvent(0,true);
+                  else if(e.a==1||e.a==3) io.AddMouseButtonEvent(0,false);
+                }
+                g_ev.clear();
+                if(!g_text.empty()){ io.AddInputCharactersUTF8(g_text.c_str()); g_text.clear(); }
+                for(int k:g_special){ ImGuiKey key=k==1?ImGuiKey_Backspace:ImGuiKey_Enter;
+                  io.AddKeyEvent(key,true); io.AddKeyEvent(key,false); }
+                g_special.clear();
+              }
+              auto now=std::chrono::steady_clock::now();
+              io.DeltaTime=std::chrono::duration<float>(now-last).count(); last=now;
+              if(io.DeltaTime<=0) io.DeltaTime=0.016f;
+              io.DisplaySize=ImVec2((float)g_w.load(),(float)g_h.load());
+              ImGui_ImplOpenGL3_NewFrame();
+              ImGui::NewFrame();
+              ui::draw();
+              g_capture.store(io.WantCaptureMouse);
+              g_wantText.store(io.WantTextInput);
+              ImGui::Render();
+              glViewport(0,0,g_w.load(),g_h.load());
+              glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+              eglSwapBuffers(dpy,surf);
+            }
+            ImGui_ImplOpenGL3_Shutdown();
+            eglMakeCurrent(dpy,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);
+            eglDestroySurface(dpy,surf); eglDestroyContext(dpy,ctx); eglTerminate(dpy);
+            ANativeWindow_release(win);
+          }
+          extern "C" __attribute__((visibility("default")))
+          void tool_surface(void* win,int w,int h,float density){
+            if(g_run.load()) return;
+            g_win.store((ANativeWindow*)win); g_w.store(w); g_h.store(h); g_density.store(density);
+            g_run.store(true); g_thr=std::thread(renderMain);
+          }
+          extern "C" __attribute__((visibility("default")))
+          void tool_surface_resize(int w,int h){ g_w.store(w); g_h.store(h); }
+          extern "C" __attribute__((visibility("default")))
+          void tool_surface_destroy(){
+            if(!g_run.load()) return;
+            g_run.store(false); if(g_thr.joinable()) g_thr.join();
+          }
+          extern "C" __attribute__((visibility("default")))
+          int tool_touch(int a,float x,float y){
+            if(!g_run.load()) return 0;
+            if(a==0||a==1||a==2||a==3){ std::lock_guard<std::mutex> lk(g_evMtx); g_ev.push_back({a,x,y}); }
+            return (g_capture.load()?1:0)|(g_wantText.load()?2:0);
+          }
+          extern "C" __attribute__((visibility("default")))
+          void tool_text(const char* s){ std::lock_guard<std::mutex> lk(g_evMtx); g_text+=s; }
+          extern "C" __attribute__((visibility("default")))
+          void tool_special(int k){ std::lock_guard<std::mutex> lk(g_evMtx); g_special.push_back(k); }
+          EOF_REND
+
+      - name: Generate native ui.cpp (all 9 tabs)
+        run: |
+          [ -f native/ui.cpp ] && exit 0
+          cat > native/ui.cpp <<'EOF_UI'
+          #include "state.h"
+          #include <imgui.h>
+          #include <imgui_stdlib.h>
+          #include <algorithm>
+          #include <fstream>
+          void toolSetDir(const std::string&);
+          static int req(){ return G.nextReq++; }
+          static ImU32 typeCol(const std::string& t){
+            if(t=="void") return IM_COL32(150,150,150,255);
+            if(t=="boolean") return IM_COL32(255,120,180,255);
+            if(t=="int"||t=="long"||t=="short"||t=="byte") return IM_COL32(110,180,255,255);
+            if(t=="float"||t=="double") return IM_COL32(90,220,220,255);
+            if(t=="char") return IM_COL32(120,220,160,255);
+            if(t=="java.lang.String"||t=="java.lang.CharSequence") return IM_COL32(240,220,110,255);
+            if(!t.empty()&&t.back()==']') return IM_COL32(200,150,255,255);
+            return IM_COL32(255,170,90,255);
+          }
+          static std::string sigOf(const MethodInfo& m){
+            std::string s=m.ret+" "+m.n+"("; for(size_t i=0;i<m.p.size();i++){ if(i)s+=", "; s+=m.p[i]; } return s+")";
+          }
+          static std::string hookTemplate(const MethodInfo& m){
+            std::string s="// "+sigOf(m)+"\n// a[i] = arguments (typed), orig() = call original\n";
+            for(size_t i=0;i<m.p.size();i++) s+="// a["+std::to_string(i)+"] : "+m.p[i]+"\n";
+            s+="return orig();\n"; return s;
+          }
+          namespace ui {
+          void toast(const std::string& s){ G.toasts.push_back({s,4.0f}); }
+          void openClass(const std::string& cls,long long h){
+            ClassWindow w; w.id=G.nextWin++; w.isList=false; w.cls=cls; w.handle=h;
+            w.title=h?(cls+" @"+std::to_string(h)):cls;
+            G.wins.push_back(w); G.activeWin=w.id;
+            bridge::post({{"t","info"},{"id",req()},{"cls",cls},{"h",h},{"ctx",{{"w",w.id},{"k","info"}}}});
+          }
+          static ClassWindow* winById(int id){ for(auto& w:G.wins) if(w.id==id) return &w; return nullptr; }
+          static ArgEditor* editorByCtx(ClassWindow& w,const json& c){
+            std::string e=c.value("e",""), m=c.value("m","");
+            if(e=="ctor") return &w.ctorArgs;
+            if(w.mu.count(m)){ if(e=="call") return &w.mu[m].callArgs; if(e=="patch") return &w.mu[m].patchArgs; }
+            return nullptr;
+          }
+          // ---------------- routing ----------------
+          void route(const json& j){
+            std::lock_guard<std::mutex> lk(G.mtx);
+            std::string t=j.value("t","");
+            if(t=="paths"){ G.cfg.dir=j.value("dir",""); G.cfg.pkg=j.value("pkg",""); G.cfg.sdk=j.value("sdk",0);
+              toolSetDir(G.cfg.dir); snprintf(G.recScope,sizeof G.recScope,"%s",G.cfg.pkg.c_str());
+              std::ifstream f(G.cfg.dir+"/settings.json");
+              if(f){ try{ json s; f>>s; G.cfg.fontScale=s.value("fontScale",1.0f); G.cfg.opacity=s.value("opacity",0.95f);
+                G.cfg.theme=s.value("theme",0); G.cfg.logCap=s.value("logCap",2000);
+                G.cfg.publishDownloads=s.value("publishDownloads",true);}catch(...){} }
+              return; }
+            if(t=="ready"){ toast("agent ready"); return; }
+            if(t=="toast"){ toast(j.value("msg","")); return; }
+            if(t=="clip"){ ImGui::SetClipboardText(j.value("text","").c_str()); return; }
+            if(t=="log"){
+              std::string ch=j.value("ch","script"); LogEntry e;
+              e.text=j.value("text",""); e.cls=j.value("cls",""); e.raw=j;
+              if(j.contains("stack")) for(auto& f:j["stack"]) e.stack.push_back({f.value("c",""),f.value("s","")});
+              auto cap=[&](std::deque<LogEntry>& d){ d.push_back(e); while((int)d.size()>G.cfg.logCap) d.pop_front(); };
+              if(ch=="track"){ std::string id=j.value("id",""); if(G.tracks.count(id)){ auto& d=G.tracks[id].log;
+                  d.push_back(e); while((int)d.size()>G.cfg.logCap) d.pop_front(); } }
+              else if(ch=="record") cap(G.recordLog);
+              else if(ch=="monitor") cap(G.monitorLog);
+              else cap(G.scriptLog);
+              return; }
+            json c=j.value("ctx",json::object()); ClassWindow* wp=winById(c.value("w",-1));
+            if(t=="callResult"&&wp){ std::string m=c.value("m",""); auto& mu=wp->mu[m];
+              mu.callResult=(j.value("ok",false)?"= ":"ERROR: ")+j.value("text","");
+              mu.callLog.push_back({mu.callResult,j.value("cls",""),{},{}}); return; }
+            if(!wp) return;
+            ClassWindow& w=*wp;
+            if(t=="classes"){ w.results=j.value("items",std::vector<std::string>{}); w.searching=false; }
+            else if(t=="info"){ w.loaded=true; w.methods.clear(); w.fields.clear();
+              for(auto& m:j.value("methods",json::array())){ MethodInfo mi; mi.n=m.value("n",""); mi.mods=m.value("mods","");
+                mi.ret=m.value("ret","void"); mi.st=m.value("st",false); mi.ov=m.value("ov",-1);
+                mi.p=m.value("p",std::vector<std::string>{}); w.methods.push_back(mi); }
+              for(auto& f:j.value("fields",json::array())){ FieldInfo fi; fi.n=f.value("n",""); fi.mods=f.value("mods","");
+                fi.t=f.value("t",""); fi.st=f.value("st",false); fi.v=f.value("v",""); w.fields.push_back(fi); }
+              w.ctors=j.value("ctors",json::array());
+              if(!w.ctors.empty()){ std::vector<std::string> t0=w.ctors[0].get<std::vector<std::string>>();
+                w.ctorArgs.init(t0,false); } }
+            else if(t=="inst"){ std::string k=c.value("k","");
+              std::vector<InstanceInfo> items;
+              for(auto& i:j.value("items",json::array())) items.push_back({i.value("h",0LL),i.value("s","")});
+              if(k=="find") w.instances=items;
+              else if(k=="argfind"){ if(ArgEditor* e=editorByCtx(w,c)){ e->results=items; e->busy=false; } } }
+            else if(t=="created"){ std::string k=c.value("k",""); long long h=j.value("h",0LL);
+              if(k=="create") openClass(w.cls,h);
+              else if(k=="argcreate"){ if(ArgEditor* e=editorByCtx(w,c)){ int i=c.value("i",0);
+                if(i>=0&&i<(int)e->vals.size()){ e->vals[i]=json{{"k","obj"},{"h",h}}; e->popupFor=-1; e->busy=false; } } }
+              else if(k=="ctorcreate") openClass(j.value("cls",w.cls),h); }
+            else if(t=="fieldVal"){ std::string m=c.value("m",""); if(w.mu.count(m)) w.mu[m].fieldVal=j.value("val",""); }
+          }
+          // ---------------- shared widgets ----------------
+          static void drawStack(const std::vector<StackFrame>& st){
+            for(auto& f:st){ ImGui::PushStyleColor(ImGuiCol_Text,typeCol("obj"));
+              if(ImGui::Selectable(f.s.c_str())) openClass(f.c);
+              ImGui::PopStyleColor(); }
+          }
+          static void drawLog(std::deque<LogEntry>& log,bool openCls){
+            ImGui::BeginChild("##log",ImVec2(-1,220),true);
+            for(auto& e:log){
+              if(openCls&&!e.cls.empty()){ if(ImGui::Selectable(e.text.c_str())) openClass(e.cls); }
+              else ImGui::TextWrapped("%s",e.text.c_str());
+              drawStack(e.stack);
+            }
+            if(ImGui::GetScrollY()>=ImGui::GetScrollMaxY()-4) ImGui::SetScrollHereY(1.0f);
+            ImGui::EndChild();
+          }
+          static void argEditor(ArgEditor& ed,const char* base,int wid,const std::string& mkey,const char* ekey,bool skipMode){
+            for(size_t i=0;i<ed.types.size();i++){
+              ImGui::PushID((int)i);
+              const std::string& ty=ed.types[i];
+              json& val=ed.vals[i];
+              bool skip=skipMode&&val.value("k","skip")=="skip";
+              if(skipMode){ bool on=!skip; ImGui::Checkbox("patch",&on);
+                val["k"]=on?(ArgEditor::isText(ty)?"prim":"obj"):"skip"; ImGui::SameLine(); }
+              ImGui::TextColored(ImColor(typeCol(ty)),"%s",ty.c_str()); ImGui::SameLine();
+              if(ArgEditor::isText(ty)){
+                std::string v=val.value("v","");
+                ImGui::SetNextItemWidth(-1);
+                if(ImGui::InputText("##v",&v)){ val["k"]=ty=="java.lang.String"||ty=="java.lang.CharSequence"?"str":"prim"; val["v"]=v; }
+              }else{
+                std::string lab=val.value("k","null")=="obj"?("object #"+std::to_string(val.value("h",0LL))):"null";
+                if(ImGui::Button(lab.c_str())) ed.popupFor=(int)i;
+                ImGui::SameLine(); if(ImGui::SmallButton("null")) val=json{{"k","null"}};
+              }
+              if(ed.popupFor==(int)i){
+                ImGui::Indent(); ImGui::BeginChild("##find",ImVec2(-1,170),true);
+                ImGui::Text("find object: %s",ty.c_str());
+                if(ImGui::Button("Find instances")){ ed.busy=true;
+                  bridge::post({{"t","inst"},{"id",req()},{"cls",ty},
+                    {"ctx",{{"w",wid},{"k","argfind"},{"m",mkey},{"e",ekey},{"i",(int)i}}}}); }
+                ImGui::SameLine();
+                if(ImGui::Button("Create (default args)")){ ed.busy=true;
+                  bridge::post({{"t","create"},{"id",req()},{"cls",ty},{"sel",-1},{"args",json::array()},
+                    {"ctx",{{"w",wid},{"k","argcreate"},{"m",mkey},{"e",ekey},{"i",(int)i}}}}); }
+                ImGui::SameLine(); if(ImGui::Button("Close")) ed.popupFor=-1;
+                if(ed.busy) ImGui::TextDisabled("working...");
+                for(auto& in:ed.results){
+                  std::string l=in.label+" ##"+std::to_string(in.h);
+                  if(ImGui::Selectable(l.c_str())){ val=json{{"k","obj"},{"h",in.h}}; ed.popupFor=-1; }
+                }
+                ImGui::EndChild(); ImGui::Unindent();
+              }
+              ImGui::PopID();
+            }
+          }
+          // ---------------- tabs ----------------
+          static void tabSettings(){
+            ImGui::SliderFloat("Font scale",&G.cfg.fontScale,0.6f,2.5f);
+            ImGui::SliderFloat("Window opacity",&G.cfg.opacity,0.3f,1.0f);
+            ImGui::Combo("Theme",&G.cfg.theme,"Dark\0Light\0Classic\0");
+            if(G.cfg.theme==0)ImGui::StyleColorsDark(); else if(G.cfg.theme==1)ImGui::StyleColorsLight(); else ImGui::StyleColorsClassic();
+            ImGui::InputInt("Log cap",&G.cfg.logCap);
+            ImGui::Checkbox("Publish dumps/crashes to Downloads (MediaStore, API29+)",&G.cfg.publishDownloads);
+            ImGui::Checkbox("Native crash handler",&G.cfg.crashHandler);
+            ImGui::TextWrapped("Files dir: %s",G.cfg.dir.c_str());
+            ImGui::TextWrapped("Package: %s  SDK: %d",G.cfg.pkg.c_str(),G.cfg.sdk);
+            if(ImGui::Button("Save settings")){
+              json s{{"fontScale",G.cfg.fontScale},{"opacity",G.cfg.opacity},{"theme",G.cfg.theme},
+                     {"logCap",G.cfg.logCap},{"publishDownloads",G.cfg.publishDownloads}};
+              std::ofstream f(G.cfg.dir+"/settings.json"); f<<s.dump(2);
+              bridge::post({{"t","settings"},{"publish",G.cfg.publishDownloads}});
+              toast("saved");
+            }
+            ImGui::Separator();
+            ImGui::TextDisabled("libtool phase 1 - frida-gum embedded, no root/server/gadget.");
+            ImGui::TextDisabled("Smali live edit: phase 2 (see README roadmap).");
+          }
+          static void tabPatches(){
+            std::map<std::string,std::vector<std::string>> byCls;
+            for(auto& [id,p]:G.patches) byCls[p.cls].push_back(id);
+            for(auto& [cls,ids]:byCls){
+              if(!ImGui::TreeNode(cls.c_str())) continue;
+              for(auto& id:ids){
+                PatchRec p=G.patches[id];
+                ImGui::PushID(id.c_str());
+                bool en=p.enabled;
+                if(ImGui::Checkbox(("##en"+id).c_str(),&en)){ p.enabled=en; G.patches[id]=p;
+                  bridge::post({{"t","patch"},{"rec",patchJson(p)}}); }
+                ImGui::SameLine();
+                bool open=ImGui::TreeNode((p.member+(p.isField?" [field]":" [method]")).c_str());
+                ImGui::SameLine(); if(ImGui::SmallButton("delete")){
+                  bridge::post({{"t","patchDel"},{"id",id}}); G.patches.erase(id); ImGui::TreePop(); ImGui::PopID(); continue; }
+                if(open){
+                  if(p.isField){
+                    std::string v=p.ret.value("v","");
+                    if(ImGui::InputText("value",&v)) p.ret["v"]=v;
+                    ImGui::Checkbox("lock (re-apply 1s poll)",&p.lock);
+                    if(ImGui::Button("Apply")){ p.ret["k"]=ArgEditor::isText(p.type)?"prim":"str";
+                      G.patches[id]=p; bridge::post({{"t","patch"},{"rec",patchJson(p)}}); }
+                  }else{
+                    ArgEditor ed; ed.types=p.params; ed.vals=p.args;
+                    argEditor(ed,"pp",0,id,"patch",true);
+                    p.args=ed.vals;
+                    bool ron=p.ret.value("k","skip")!="skip";
+                    if(ImGui::Checkbox("patch return",&ron)) p.ret["k"]=ron?"prim":"skip";
+                    if(ron){ std::string v=p.ret.value("v",""); ImGui::SetNextItemWidth(-1);
+                      if(ImGui::InputText("ret",&v)){ p.ret["v"]=v; p.ret["k"]=ArgEditor::isText(p.retType)?"prim":"str"; } }
+                    if(ImGui::Button("Apply")){ G.patches[id]=p; bridge::post({{"t","patch"},{"rec",patchJson(p)}}); }
+                  }
+                  ImGui::TreePop();
+                }
+                ImGui::PopID();
+              }
+              ImGui::TreePop();
+            }
+            if(G.patches.empty()) ImGui::TextDisabled("No patches. Register from Classes tab.");
+          }
+          static json patchJson(const PatchRec& p){
+            return json{{"id",p.id},{"cls",p.cls},{"member",p.member},{"isField",p.isField},{"enabled",p.enabled},
+                        {"ov",p.ov},{"args",p.args},{"ret",p.ret},{"lock",p.lock},{"type",p.type},{"retType",p.retType}};
+          }
+          static json hookJson(const HookRec& h){
+            return json{{"id",h.id},{"cls",h.cls},{"name",h.name},{"ov",h.ov},{"mode",h.mode},
+                        {"code",h.code},{"enabled",h.enabled},{"ret",h.ret}};
+          }
+          static void tabHooks(){
+            for(auto& [id,h0]:G.hooks){
+              HookRec h=h0; ImGui::PushID(id.c_str());
+              bool en=h.enabled;
+              if(ImGui::Checkbox("##en",&en)){ h.enabled=en; G.hooks[id]=h; bridge::post({{"t","hook"},{"rec",hookJson(h)}}); }
+              ImGui::SameLine();
+              bool open=ImGui::TreeNode((h.cls+"::"+h.name).c_str());
+              ImGui::SameLine(); if(ImGui::SmallButton("delete")){
+                bridge::post({{"t","hookDel"},{"id",id}}); G.hooks.erase(id); if(open)ImGui::TreePop(); ImGui::PopID(); continue; }
+              if(open){
+                int mode=h.mode=="java"?0:(h.mode=="smali"?1:2);
+                ImGui::Combo("mode",&mode,"Java (JS)\0Smali (phase 2)\0Noop\0");
+                h.mode=mode==0?"java":(mode==1?"smali":"noop");
+                if(h.mode=="java"){
+                  ImGui::InputTextMultiline("##code",&h.code,ImVec2(-1,220));
+                }else if(h.mode=="smali"){
+                  ImGui::TextWrapped("Smali live editing needs the embedded assembler module (phase 2). Use Java (JS) or Noop for now.");
+                }else ImGui::TextDisabled("Returns default value for return type; body skipped.");
+                if(ImGui::Button("Apply")){ G.hooks[id]=h; bridge::post({{"t","hook"},{"rec",hookJson(h)}}); }
+                ImGui::TreePop();
+              }
+              ImGui::PopID();
+            }
+            if(G.hooks.empty()) ImGui::TextDisabled("No hooks. Register from Classes tab.");
+          }
+          static void tabTrackers(){
+            for(auto& [id,t0]:G.tracks){
+              TrackRec t=t0; ImGui::PushID(id.c_str());
+              bool en=t.enabled;
+              if(ImGui::Checkbox("##en",&en)){ t.enabled=en; G.tracks[id]=t;
+                bridge::post({{"t","track"},{"id",id},{"cls",t.cls},{"member",t.member},{"isField",t.isField},{"on",en}}); }
+              ImGui::SameLine();
+              bool open=ImGui::TreeNode((t.cls+"::"+t.member).c_str());
+              ImGui::SameLine(); if(ImGui::SmallButton("clear")) G.tracks[id].log.clear();
+              ImGui::SameLine(); if(ImGui::SmallButton("delete")){
+                bridge::post({{"t","trackDel"},{"id",id},{"cls",t.cls},{"member",t.member},{"isField",t.isField}});
+                G.tracks.erase(id); if(open)ImGui::TreePop(); ImGui::PopID(); continue; }
+              if(open){
+                if(t.isField) ImGui::TextDisabled("field track = value-change watch (1s poll)");
+                ImGui::BeginChild("##tl",ImVec2(-1,240),true);
+                for(auto& e:G.tracks[id].log){ ImGui::TextWrapped("%s",e.text.c_str()); drawStack(e.stack); }
+                ImGui::EndChild(); ImGui::TreePop();
+              }
+              ImGui::PopID();
+            }
+            if(G.tracks.empty()) ImGui::TextDisabled("No trackers. Register from Classes tab.");
+          }
+          static void tabDumper(){
+            if(ImGui::Button("Scan memory & dump all loaded DEX")) bridge::post({{"t","dump"}});
+            ImGui::TextWrapped("Dumps go to: %s (and Downloads if enabled in Settings)",G.cfg.dir.c_str());
+            for(auto& [p,n]:G.dumped) ImGui::TextWrapped("%s  (%lld bytes)",p.c_str(),n);
+          }
+          static void tabRecorder(){
+            ImGui::SetNextItemWidth(-1); ImGui::InputText("scope prefix",G.recScope,sizeof G.recScope);
+            if(!G.recorderOn){ if(ImGui::Button("Start")){ G.recorderOn=true;
+              bridge::post({{"t","record"},{"on",true},{"scope",G.recScope}}); } }
+            else { if(ImGui::Button("Stop")){ G.recorderOn=false; bridge::post({{"t","record"},{"on",false}}); } }
+            ImGui::SameLine(); if(ImGui::Button("Clear")) G.recordLog.clear();
+            ImGui::TextDisabled("Hooks all methods of classes under scope (capped). Fields not recorded in phase 1.");
+            drawLog(G.recordLog,true);
+          }
+          static void tabMonitor(){
+            if(!G.monitorOn){ if(ImGui::Button("Start")){ G.monitorOn=true; bridge::post({{"t","monitor"},{"on",true}}); } }
+            else { if(ImGui::Button("Stop")){ G.monitorOn=false; bridge::post({{"t","monitor"},{"on",false}}); } }
+            ImGui::SameLine(); if(ImGui::Button("Clear")) G.monitorLog.clear();
+            ImGui::TextDisabled("SSL_read/SSL_write plaintext + URL opens, with Java caller stack when available.");
+            ImGui::BeginChild("##ml",ImVec2(-1,260),true);
+            for(int i=0;i<(int)G.monitorLog.size();i++){
+              auto& e=G.monitorLog[i];
+              if(ImGui::Selectable(e.text.c_str())) G.monitorDetail=i;
+            }
+            ImGui::EndChild();
+            if(G.monitorDetail>=0&&G.monitorDetail<(int)G.monitorLog.size()&&ImGui::BeginPopupModal("Traffic detail",nullptr,ImGuiWindowFlags_AlwaysAutoResize)){
+              auto& e=G.monitorLog[G.monitorDetail];
+              ImGui::TextWrapped("%s",e.raw.value("preview","").c_str());
+              ImGui::Separator(); drawStack(e.stack);
+              if(ImGui::Button("Close")){ ImGui::CloseCurrentPopup(); G.monitorDetail=-1; }
+              ImGui::EndPopup();
+            }
+            if(G.monitorDetail>=0) ImGui::OpenPopup("Traffic detail");
+          }
+          static void tabScript(){
+            ImGui::InputTextMultiline("##src",G.scriptBuf,sizeof G.scriptBuf,ImVec2(-1,ImGui::GetContentRegionAvail().y*0.5f));
+            if(ImGui::Button("Run")) bridge::post({{"t","eval"},{"code",G.scriptBuf}});
+            ImGui::SameLine(); if(ImGui::Button("Clear log")) G.scriptLog.clear();
+            ImGui::TextDisabled("Frida JS (Java, Interceptor, Memory...). console.log below.");
+            drawLog(G.scriptLog,false);
+          }
+          // ---------------- classes tab ----------------
+          static void memberPanels(ClassWindow& w,const MethodInfo& m,const std::string& key){
+            MemberUI& mu=w.mu[key];
+            auto toggle=[&](const char* l,bool& b){ if(ImGui::SmallButton(l)) b=!b; ImGui::SameLine(); };
+            toggle("Call",mu.call); toggle("Patch",mu.patch); toggle("Track",mu.track); toggle("Hook",mu.hook);
+            ImGui::NewLine();
+            if(mu.call){
+              if(mu.callArgs.types.empty()) mu.callArgs.init(m.p,false);
+              argEditor(mu.callArgs,"ca",w.id,key,"call",false);
+              if(ImGui::Button("Call")){
+                bridge::post({{"t","call"},{"id",req()},{"cls",w.cls},{"name",m.n},{"ov",m.ov},
+                  {"h",w.handle},{"args",mu.callArgs.vals},
+                  {"ctx",{{"w",w.id},{"k","call"},{"m",key}}}});
+              }
+              ImGui::TextWrapped("%s",mu.callResult.c_str());
+              for(auto& e:mu.callLog) ImGui::TextDisabled("%s",e.text.c_str());
+            }
+            if(mu.patch){
+              if(mu.patchArgs.types.empty()) mu.patchArgs.init(m.p,true);
+              argEditor(mu.patchArgs,"pa",w.id,key,"patch",true);
+              bool ron=mu.patchRet.value("k","skip")!="skip";
+              if(ImGui::Checkbox("patch return",&ron)) mu.patchRet["k"]=ron?"prim":"skip";
+              if(ron){ std::string v=mu.patchRet.value("v",""); ImGui::SetNextItemWidth(-1);
+                if(ImGui::InputText("ret",&v)){ mu.patchRet["v"]=v;
+                  mu.patchRet["k"]=ArgEditor::isText(m.ret)?"prim":"str"; } }
+              if(ImGui::Button("Register patch")){
+                PatchRec p; p.id=key; p.cls=w.cls; p.member=m.n; p.ov=m.ov; p.params=m.p;
+                p.args=mu.patchArgs.vals; p.ret=mu.patchRet; p.retType=m.ret;
+                G.patches[key]=p; bridge::post({{"t","patch"},{"rec",patchJson(p)}}); toast("patch registered");
+              }
+            }
+            if(mu.track){
+              bool on=G.tracks.count(key)&&G.tracks[key].enabled;
+              if(ImGui::Checkbox("track on/off",&on)){
+                if(on){ TrackRec t; t.id=key; t.cls=w.cls; t.member=m.n; G.tracks[key]=t; }
+                bridge::post({{"t","track"},{"id",key},{"cls",w.cls},{"member",m.n},{"ov",m.ov},{"isField",false},{"on",on}});
+                if(!on) G.tracks.erase(key);
+              }
+              ImGui::TextDisabled("Logs appear in Trackers tab.");
+            }
+            if(mu.hook){
+              if(mu.hookCode.empty()) mu.hookCode=hookTemplate(m);
+              int mode=mu.hookMode=="java"?0:(mu.hookMode=="smali"?1:2);
+              ImGui::Combo("mode",&mode,"Java (JS)\0Smali (phase 2)\0Noop\0");
+              mu.hookMode=mode==0?"java":(mode==1?"smali":"noop");
+              if(mu.hookMode=="java") ImGui::InputTextMultiline("##hc",&mu.hookCode,ImVec2(-1,180));
+              if(mu.hookMode=="smali") ImGui::TextWrapped("Phase 2: embedded smali assembler. Use Java (JS)/Noop.");
+              if(ImGui::Button("Apply hook")){
+                HookRec h; h.id=key; h.cls=w.cls; h.name=m.n; h.ov=m.ov; h.mode=mu.hookMode;
+                h.code=mu.hookCode; h.ret=m.ret; h.params=m.p;
+                G.hooks[key]=h; bridge::post({{"t","hook"},{"rec",hookJson(h)}}); toast("hook applied");
+              }
+            }
+          }
+          static void fieldPanel(ClassWindow& w,const FieldInfo& f,const std::string& key){
+            MemberUI& mu=w.mu[key];
+            std::string cur=(w.handle||f.st)?(mu.fieldVal.empty()?f.v:mu.fieldVal):"(needs instance)";
+            ImGui::Text("current: %s",cur.c_str());
+            if((w.handle||f.st)&&ImGui::Button("Read"))
+              bridge::post({{"t","fieldGet"},{"cls",w.cls},{"name",f.n},{"h",w.handle},{"type",f.t},
+                {"ctx",{{"w",w.id},{"k","field"},{"m",key}}}});
+            ImGui::SetNextItemWidth(-1); ImGui::InputText("value",&mu.fieldVal);
+            if(ImGui::Button("Set"))
+              bridge::post({{"t","fieldSet"},{"cls",w.cls},{"name",f.n},{"h",w.handle},{"type",f.t},{"val",mu.fieldVal}});
+            ImGui::SameLine();
+            if(ImGui::Button("Patch")){
+              PatchRec p; p.id=key; p.cls=w.cls; p.member=f.n; p.isField=true; p.type=f.t;
+              p.ret=json{{"k","prim"},{"v",mu.fieldVal}}; p.lock=mu.fieldLock; p.enabled=true;
+              G.patches[key]=p; bridge::post({{"t","patch"},{"rec",patchJson(p)}});
+            }
+            ImGui::Checkbox("lock (poll)",&mu.fieldLock);
+            bool tr=G.tracks.count(key)&&G.tracks[key].enabled;
+            if(ImGui::Checkbox("track changes",&tr)){
+              if(tr){ TrackRec t; t.id=key; t.cls=w.cls; t.member=f.n; t.isField=true; G.tracks[key]=t; }
+              else G.tracks.erase(key);
+              bridge::post({{"t","track"},{"id",key},{"cls",w.cls},{"member",f.n},{"isField",true},{"on",tr}});
+            }
+          }
+          static void classWindow(ClassWindow& w){
+            if(!w.loaded){ ImGui::TextDisabled("loading..."); return; }
+            ImGui::SetNextItemWidth(-1); ImGui::InputText("filter members",w.mfilter,sizeof w.mfilter);
+            if(ImGui::Button("Instances")) w.instPanel=!w.instPanel;
+            ImGui::SameLine(); if(ImGui::SmallButton("close window")) w.open=false;
+            if(w.instPanel){
+              ImGui::BeginChild("##inst",ImVec2(-1,230),true);
+              if(ImGui::Button("Find")) bridge::post({{"t","inst"},{"id",req()},{"cls",w.cls},
+                {"ctx",{{"w",w.id},{"k","find"}}}});
+              ImGui::SameLine(); if(ImGui::Button("Create")) w.creating=!w.creating;
+              if(w.creating&&!w.ctors.empty()){
+                std::vector<std::string> labels;
+                for(auto& c:w.ctors){ std::string s="("; for(auto& t:c.get<std::vector<std::string>>()) s+=t+" "; s+=")"; labels.push_back(s); }
+                std::vector<const char*> ptrs; for(auto& l:labels) ptrs.push_back(l.c_str());
+                if(ImGui::Combo("constructor",&w.ctorSel,ptrs.data(),(int)ptrs.size())){
+                  w.ctorArgs.init(w.ctors[w.ctorSel].get<std::vector<std::string>>(),false); }
+                argEditor(w.ctorArgs,"ct",w.id,"","ctor",false);
+                if(ImGui::Button("Create instance"))
+                  bridge::post({{"t","create"},{"id",req()},{"cls",w.cls},{"sel",w.ctorSel},{"args",w.ctorArgs.vals},
+                    {"ctx",{{"w",w.id},{"k","create"}}}});
+              }
+              for(auto& in:w.instances){
+                std::string l=in.label+" ##"+std::to_string(in.h);
+                if(ImGui::Selectable(l.c_str())) openClass(w.cls,in.h);
+              }
+              ImGui::EndChild();
+            }
+            std::string fl=w.mfilter;
+            if(ImGui::CollapsingHeader("Fields",ImGuiTreeNodeFlags_DefaultOpen)){
+              for(auto& f:w.fields){
+                if(!fl.empty()&&f.n.find(fl)==std::string::npos) continue;
+                std::string key=w.cls+"::"+f.n;
+                ImGui::PushID(key.c_str());
+                ImGui::TextColored(ImColor(typeCol(f.t)),"%s",f.t.c_str()); ImGui::SameLine();
+                bool open=ImGui::TreeNode((f.mods+" "+f.n).c_str());
+                if(open){ fieldPanel(w,f,key); ImGui::TreePop(); }
+                ImGui::PopID();
+              }
+            }
+            if(ImGui::CollapsingHeader("Methods",ImGuiTreeNodeFlags_DefaultOpen)){
+              for(auto& m:w.methods){
+                if(!fl.empty()&&m.n.find(fl)==std::string::npos) continue;
+                std::string key=w.cls+"::"+m.n+"#"+std::to_string(m.ov);
+                ImGui::PushID(key.c_str());
+                ImGui::TextColored(ImColor(typeCol(m.ret)),"%s",m.ret.c_str()); ImGui::SameLine();
+                bool open=ImGui::TreeNode(sigOf(m).c_str());
+                if(open){ ImGui::TextDisabled("%s",m.mods.c_str()); memberPanels(w,m,key); ImGui::TreePop(); }
+                ImGui::PopID();
+              }
+            }
+          }
+          static void listWindow(ClassWindow& w){
+            ImGui::SetNextItemWidth(-1); ImGui::InputText("filter",w.filter,sizeof w.filter);
+            ImGui::Combo("mode",&w.mode,"Class\0Method\0Field\0");
+            if(w.mode==1) ImGui::Combo("by",&w.sub,"Name\0Return type\0Param type\0");
+            if(w.mode==2) ImGui::Combo("by",&w.sub,"Name\0Type\0");
+            if(ImGui::Button("Search")){ w.searching=true;
+              bridge::post({{"t","enum"},{"id",req()},{"filter",w.filter},{"mode",w.mode},{"sub",w.sub},
+                {"ctx",{{"w",w.id},{"k","list"}}}}); }
+            ImGui::SameLine(); if(ImGui::SmallButton("close window")) w.open=false;
+            if(w.searching) ImGui::TextDisabled("searching...");
+            ImGui::Text("%zu results",(size_t)w.results.size());
+            ImGui::BeginChild("##res",ImVec2(-1,-1),true);
+            for(auto& r:w.results) if(ImGui::Selectable(r.c_str())) openClass(r);
+            ImGui::EndChild();
+          }
+          static void tabClasses(){
+            ImGui::BeginTabBar("##cw");
+            if(ImGui::TabItemButton("+")){ ClassWindow w; w.id=G.nextWin++; G.wins.push_back(w); G.activeWin=w.id; }
+            for(auto& w:G.wins){
+              if(!w.open) continue;
+              std::string lab=w.title+"###w"+std::to_string(w.id);
+              if(ImGui::BeginTabItem(lab.c_str())){
+                G.activeWin=w.id;
+                if(w.isList) listWindow(w); else classWindow(w);
+                ImGui::EndTabItem();
+              }
+            }
+            ImGui::EndTabBar();
+            G.wins.erase(std::remove_if(G.wins.begin(),G.wins.end(),[](const ClassWindow& w){return !w.open;}),G.wins.end());
+            if(G.wins.empty()){ ClassWindow w; w.id=G.nextWin++; G.wins.push_back(w); }
+          }
+          // ---------------- frame ----------------
+          void draw(){
+            std::lock_guard<std::mutex> lk(G.mtx);
+            ImGuiIO& io=ImGui::GetIO();
+            io.FontGlobalScale=G.cfg.fontScale;
+            ImGui::SetNextWindowPos(ImVec2(8,140),ImGuiCond_FirstUseEver);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(6,6));
+            ImGui::Begin("##toggle",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoNav);
+            if(ImGui::Button(G.menuOpen?"X":"TOOL")) G.menuOpen=!G.menuOpen;
+            ImGui::End(); ImGui::PopStyleVar();
+            if(G.menuOpen){
+              ImGui::SetNextWindowSize(ImVec2(std::min(520.0f,io.DisplaySize.x-16),std::min(700.0f,io.DisplaySize.y-60)),ImGuiCond_FirstUseEver);
+              ImGui::SetNextWindowPos(ImVec2(8,180),ImGuiCond_FirstUseEver);
+              ImGui::SetNextWindowBgAlpha(G.cfg.opacity);
+              ImGui::Begin("libtool",&G.menuOpen);
+              if(ImGui::BeginTabBar("##main")){
+                if(ImGui::BeginTabItem("Settings")){ tabSettings(); ImGui::EndTabItem(); }
+                if(ImGui::BeginTabItem("Patches")){ tabPatches(); ImGui::EndTabItem(); }
+                if(ImGui::BeginTabItem("Hooks")){ tabHooks(); ImGui::EndTabItem(); }
+                if(ImGui::BeginTabItem("Trackers")){ tabTrackers(); ImGui::EndTabItem(); }
+                if(ImGui::BeginTabItem("Dumper")){ tabDumper(); ImGui::EndTabItem(); }
+                if(ImGui::BeginTabItem("Recorder")){ tabRecorder(); ImGui::EndTabItem(); }
+                if(ImGui::BeginTabItem("Monitor")){ tabMonitor(); ImGui::EndTabItem(); }
+                if(ImGui::BeginTabItem("Script")){ tabScript(); ImGui::EndTabItem(); }
+                if(ImGui::BeginTabItem("Classes")){ tabClasses(); ImGui::EndTabItem(); }
+                ImGui::EndTabBar();
+              }
+              ImGui::End();
+            }
+            float y=io.DisplaySize.y-30;
+            for(auto it=G.toasts.begin();it!=G.toasts.end();){
+              it->second-=io.DeltaTime;
+              if(it->second<=0){ it=G.toasts.erase(it); continue; }
+              ImGui::SetNextWindowPos(ImVec2(8,y-28)); y-=32;
+              ImGui::Begin(("##toast"+std::to_string((size_t)&*it)).c_str(),nullptr,
+                ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoInputs|ImGuiWindowFlags_NoNav);
+              ImGui::TextUnformatted(it->first.c_str()); ImGui::End(); ++it;
+            }
+          }
+          } // namespace ui
+          EOF_UI
+
+      # ============================================================
+      # 2) AGENT (frida-java-bridge bundled by frida-compile)
+      # ============================================================
+      - name: Generate agent
+        run: |
+          [ -f agent/index.js ] && exit 0
+          mkdir -p agent
+          cat > agent/index.js <<'EOF_IDX'
+          const Java = require('frida-java-bridge');
+          const core = require('./core');
+          const overlay = require('./overlay');
+          const features = require('./features');
+
+          const origLog = console.log.bind(console);
+          ['log','warn','error'].forEach(k => {
+            console[k] = (...a) => { try { send({t:'log', ch:'script', text:a.map(String).join(' ')}); } catch(e){} origLog(...a); };
+          });
+
+          Java.perform(() => {
+            const app = Java.use('android.app.ActivityThread').currentApplication();
+            const ctx = app.getApplicationContext();
+            const File = Java.use('java.io.File');
+            const dir = File.$new(ctx.getExternalFilesDir(null), 'tool');
+            dir.mkdirs();
+            const Build = Java.use('android.os.Build$VERSION');
+            send({t:'paths', dir:dir.getAbsolutePath(), pkg:ctx.getPackageName(), sdk:Build.SDK_INT.value});
+            core.init(ctx);
+            features.init(ctx, dir.getAbsolutePath());
+            overlay.start(app);
+            function loop(m){
+              try { Java.performNow(() => core.dispatch(m)); }
+              catch(e){ send({t:'toast', msg:''+e}); }
+              recv('cmd', loop);
+            }
+            recv('cmd', loop);
+            send({t:'ready'});
+          });
+          EOF_IDX
+          cat > agent/core.js <<'EOF_CORE'
+          const Java = require('frida-java-bridge');
+          const handles = new Map(); let nextH = 1;
+          const state = new Map();   // key cls::name#ov -> {klass,name,ov,ret,types,patch,hook,track,record,trackId,installed}
+          const fieldState = new Map(); // key cls::field -> {lockTimer,watchTimer,last,patch}
+          let appCtx = null;
+
+          function retain(o){ const h=nextH++; handles.set(h, Java.retain(o)); return h; }
+          function safeStr(o){ try { return ''+o; } catch(e){ return '<obj>'; } }
+          function key(c,n,ov){ return c+'::'+n+'#'+ov; }
+          function isPrim(t){ return ['int','long','short','byte','float','double','boolean','char'].indexOf(t)>=0; }
+          function coerce(t,v){
+            if(t==='boolean') return v===true||v==='true';
+            if(t==='char') return (''+v).charCodeAt(0)||0;
+            if(t==='long'||t==='int'||t==='short'||t==='byte') return parseInt(v)||0;
+            if(t==='float'||t==='double') return parseFloat(v)||0;
+            return v;
+          }
+          function dec(enc,t,orig){
+            if(!enc) return orig;
+            switch(enc.k){
+              case 'skip': return orig;
+              case 'null': return null;
+              case 'str': return ''+enc.v;
+              case 'prim': return coerce(t,enc.v);
+              case 'obj': { const o=handles.get(enc.h); return o===undefined?null:o; }
+              default: return orig;
+            }
+          }
+          function defRet(t){
+            if(t==='void') return undefined;
+            if(t==='boolean') return false;
+            if(isPrim(t)) return 0;
+            return null;
+          }
+          function stack(){
+            try {
+              const T = Java.use('java.lang.Thread');
+              const st = T.currentThread().getStackTrace();
+              const out=[];
+              for(let i=3;i<st.length&&out.length<8;i++){
+                const f=st[i]; const c=f.getClassName();
+                if(c.startsWith('re.tool.')||c.startsWith('java.lang.Thread')) continue;
+                out.push({c:c, s:''+f});
+              }
+              return out;
+            } catch(e){ return []; }
+          }
+          function logCall(st,args,ret,phase){
+            const ch = st.track ? 'track' : 'record';
+            const id = st.track ? st.trackId : key(st.cls,st.name,st.ov);
+            const a = args.map(safeStr).join(', ');
+            const text = phase==='exit'
+              ? st.cls+'.'+st.name+'('+a+') -> '+safeStr(ret)
+              : st.cls+'.'+st.name+'('+a+')';
+            send({t:'log', ch:ch, id:id, cls:st.cls, name:st.name, text:text, stack:stack()});
+          }
+          function ensure(st){
+            if(st.installed) return;
+            const ovf = st.klass[st.name].overloads[st.ov];
+            ovf.implementation = function(...args){
+              let a = args;
+              if(st.patch && st.patch.enabled && !st.patch.isField)
+                a = args.map((v,i)=>dec(st.patch.args[i], st.types[i], v));
+              const tracing = (st.track&&st.trackOn)||st.record;
+              if(tracing) logCall(st,a,null,'enter');
+              let r;
+              if(st.hook && st.hook.enabled){
+                if(st.hook.mode==='noop') r = defRet(st.ret);
+                else if(st.hook.fn) r = st.hook.fn.call(this,a,()=>ovf.apply(this,a));
+                else r = ovf.apply(this,a);
+              } else r = ovf.apply(this,a);
+              if(st.patch && st.patch.enabled && !st.patch.isField && st.patch.ret && st.patch.ret.k!=='skip')
+                r = dec(st.patch.ret, st.ret, r);
+              if(tracing) logCall(st,a,r,'exit');
+              return r;
+            };
+            st.installed = true;
+          }
+          function maybeRemove(st){
+            if(st.patch||st.hook||(st.track&&st.trackOn)||st.record) return;
+            try { st.klass[st.name].overloads[st.ov].implementation = null; } catch(e){}
+            state.delete(st.key);
+          }
+          function getSt(cls,name,ov){
+            const k = key(cls,name,ov);
+            let st = state.get(k);
+            if(!st){
+              const klass = Java.use(cls);
+              const ovf = klass[name].overloads[ov];
+              st = { key:k, cls:cls, name:name, ov:ov, klass:klass,
+                     ret:ovf.returnType.className, types:ovf.argumentTypes.map(t=>t.className),
+                     installed:false };
+              state.set(k,st);
+            }
+            return st;
+          }
+          function setField(cls,name,h,type,val){
+            const klass = Java.use(cls);
+            const v = isPrim(type)?coerce(type,val):(type==='java.lang.String'?''+val:val);
+            if(h){ Java.cast(handles.get(h),klass)[name].value = v; }
+            else klass[name].value = v;
+          }
+          function readField(cls,name,h){
+            const klass = Java.use(cls);
+            const o = h?Java.cast(handles.get(h),klass):klass;
+            return safeStr(o[name].value);
+          }
+          function classInfo(cls,h){
+            const klass = Java.use(cls);
+            const Modifier = Java.use('java.lang.reflect.Modifier');
+            const methods=[], fields=[], ctors=[];
+            const ms = klass.class.getDeclaredMethods();
+            for(let i=0;i<ms.length;i++){
+              const m=ms[i]; const n=m.getName();
+              const ps=m.getParameterTypes(); const p=[];
+              for(let j=0;j<ps.length;j++) p.push(ps[j].getName());
+              const mods=m.getModifiers();
+              let ov=-1;
+              try {
+                const ovs=klass[n].overloads;
+                for(let o=0;o<ovs.length;o++){
+                  const at=ovs[o].argumentTypes.map(t=>t.className);
+                  if(at.length===p.length&&at.every((t,x)=>t===p[x])){ ov=o; break; }
+                }
+              } catch(e){}
+              methods.push({n:n, mods:Modifier.toString(mods), ret:m.getReturnType().getName(),
+                            p:p, st:Modifier.isStatic(mods), ov:ov});
+            }
+            const fs = klass.class.getDeclaredFields();
+            const inst = h?Java.cast(handles.get(h),klass):null;
+            for(let i=0;i<fs.length;i++){
+              const f=fs[i]; const mods=f.getModifiers(); const st=Modifier.isStatic(mods);
+              let v='';
+              try { v = st?safeStr(klass[f.getName()].value):(inst?safeStr(inst[f.getName()].value):''); } catch(e){}
+              fields.push({n:f.getName(), mods:Modifier.toString(mods), t:f.getType().getName(), st:st, v:v});
+            }
+            const cs = klass.class.getDeclaredConstructors();
+            for(let i=0;i<cs.length;i++){
+              const ps=cs[i].getParameterTypes(); const p=[];
+              for(let j=0;j<ps.length;j++) p.push(ps[j].getName());
+              ctors.push(p);
+            }
+            return {methods:methods, fields:fields, ctors:ctors};
+          }
+          function enumerate(filter,mode,sub){
+            const f=(filter||'').toLowerCase();
+            const names = Java.enumerateLoadedClassesSync();
+            const out=[];
+            if(mode===0){
+              for(const n of names){ if(out.length>=500) break;
+                if(!f||n.toLowerCase().indexOf(f)>=0) out.push(n); }
+              return out;
+            }
+            let scanned=0;
+            for(const n of names){
+              if(out.length>=300||scanned>=20000) break;
+              if(n.startsWith('[')||n.startsWith('re.tool.')) continue;
+              scanned++;
+              try {
+                const k=Java.use(n);
+                if(mode===1){
+                  const ms=k.class.getDeclaredMethods();
+                  for(let i=0;i<ms.length;i++){
+                    const m=ms[i]; let hit=false;
+                    if(sub===0) hit=m.getName().toLowerCase().indexOf(f)>=0;
+                    else if(sub===1) hit=m.getReturnType().getName().toLowerCase().indexOf(f)>=0;
+                    else { const ps=m.getParameterTypes();
+                      for(let j=0;j<ps.length;j++) if(ps[j].getName().toLowerCase().indexOf(f)>=0) hit=true; }
+                    if(hit&&f){ out.push(n); break; }
+                  }
+                } else {
+                  const fs=k.class.getDeclaredFields();
+                  for(let i=0;i<fs.length;i++){
+                    const fl=fs[i];
+                    const s=(sub===0?fl.getName():fl.getType().getName()).toLowerCase();
+                    if(f&&s.indexOf(f)>=0){ out.push(n); break; }
+                  }
+                }
+              } catch(e){}
+            }
+            return out;
+          }
+          function doCreate(m){
+            const klass=Java.use(m.cls);
+            const sel=m.sel;
+            let args=[];
+            let ctor;
+            const news=klass.$new;
+            if(sel>=0&&news.overloads&&news.overloads[sel]){
+              ctor=news.overloads[sel];
+              args=m.args.map((e,i)=>dec(e,ctor.argumentTypes[i].className,null));
+            } else {
+              // default-args create: pick ctor with fewest params
+              let best=null,bn=1e9;
+              if(news.overloads) for(const o of news.overloads)
+                if(o.argumentTypes.length<bn){ bn=o.argumentTypes.length; best=o; }
+              ctor=best;
+              if(ctor) args=ctor.argumentTypes.map(t=>{
+                const c=t.className;
+                if(c==='boolean') return false;
+                if(isPrim(c)) return 0;
+                if(c==='java.lang.String') return '';
+                return null;
+              });
+            }
+            const obj = ctor?ctor.apply(klass,args):klass.$new();
+            const h=retain(obj);
+            send({t:'created', ctx:m.ctx, h:h, label:safeStr(obj), cls:m.cls});
+          }
+          function dispatch(m){
+            const t=m.t;
+            if(t==='enum'){ send({t:'classes', ctx:m.ctx, items:enumerate(m.filter,m.mode,m.sub)}); }
+            else if(t==='info'){ const i=classInfo(m.cls,m.h); i.t='info'; i.ctx=m.ctx; i.cls=m.cls; send(i); }
+            else if(t==='call'){
+              try {
+                const klass=Java.use(m.cls);
+                const ovf=klass[m.name].overloads[m.ov];
+                const recv=m.h?Java.cast(handles.get(m.h),klass):klass;
+                const args=m.args.map((e,i)=>dec(e,ovf.argumentTypes[i].className,null));
+                const r=ovf.apply(recv,args);
+                send({t:'callResult', ctx:m.ctx, ok:true, text:safeStr(r), cls:m.cls});
+              } catch(e){ send({t:'callResult', ctx:m.ctx, ok:false, text:''+e, cls:m.cls}); }
+            }
+            else if(t==='patch'){
+              const r=m.rec;
+              if(r.isField){
+                const fk=r.cls+'::'+r.member;
+                let fs=fieldState.get(fk)||{};
+                if(fs.lockTimer){ clearInterval(fs.lockTimer); fs.lockTimer=null; }
+                if(r.enabled){
+                  setField(r.cls,r.member,0,r.type,r.ret.v);
+                  if(r.lock) fs.lockTimer=setInterval(()=>{ try{ setField(r.cls,r.member,0,r.type,r.ret.v);}catch(e){} },1000);
+                }
+                fs.patch=r; fieldState.set(fk,fs);
+              } else {
+                const st=getSt(r.cls,r.member,r.ov);
+                st.patch=r.enabled?r:null; ensure(st);
+              }
+              send({t:'toast', msg:'patch '+(r.enabled?'applied':'disabled')});
+            }
+            else if(t==='patchDel'){
+              const p=m.id;
+              for(const [k,st] of state) if(st.patch&&st.patch.id===p){ st.patch=null; maybeRemove(st); }
+              const fs=fieldState.get(p); if(fs&&fs.lockTimer) clearInterval(fs.lockTimer);
+              fieldState.delete(p);
+            }
+            else if(t==='hook'){
+              const r=m.rec;
+              if(r.mode==='smali'){ send({t:'toast', msg:'smali mode ships in phase 2'}); return; }
+              const st=getSt(r.cls,r.name,r.ov);
+              if(r.mode==='java'){
+                try { r.fn=new Function('a','orig',r.code); }
+                catch(e){ send({t:'toast', msg:'hook compile error: '+e}); return; }
+              }
+              st.hook=r.enabled?r:null; ensure(st);
+              send({t:'toast', msg:'hook '+(r.enabled?'applied':'disabled')});
+            }
+            else if(t==='hookDel'){
+              for(const [k,st] of state) if(st.hook&&st.hook.id===m.id){ st.hook=null; maybeRemove(st); }
+            }
+            else if(t==='track'){
+              if(m.isField){
+                const fk=m.cls+'::'+m.member;
+                let fs=fieldState.get(fk)||{};
+                if(fs.watchTimer){ clearInterval(fs.watchTimer); fs.watchTimer=null; }
+                if(m.on){
+                  fs.last=readField(m.cls,m.member,0);
+                  fs.watchTimer=setInterval(()=>{
+                    try { const v=readField(m.cls,m.member,0);
+                      if(v!==fs.last){ send({t:'log', ch:'track', id:m.id, cls:m.cls, name:m.member,
+                        text:m.cls+'.'+m.member+': '+fs.last+' -> '+v, stack:[]}); fs.last=v; } } catch(e){}
+                  },1000);
+                }
+                fieldState.set(fk,fs);
+              } else {
+                const st=getSt(m.cls,m.member,m.ov);
+                st.track=m.on; st.trackOn=m.on; st.trackId=m.id;
+                if(m.on) ensure(st); else maybeRemove(st);
+              }
+            }
+            else if(t==='trackDel'){
+              for(const [k,st] of state) if(st.trackId===m.id){ st.track=false; st.trackOn=false; maybeRemove(st); }
+              const fs=fieldState.get(m.cls+'::'+m.member);
+              if(fs&&fs.watchTimer){ clearInterval(fs.watchTimer); fs.watchTimer=null; }
+            }
+            else if(t==='inst'){
+              const items=[];
+              Java.choose(m.cls,{
+                onMatch(o){ if(items.length<200) items.push({h:retain(o), s:safeStr(o)}); },
+                onComplete(){ send({t:'inst', ctx:m.ctx, items:items}); }
+              });
+            }
+            else if(t==='create'){ doCreate(m); }
+            else if(t==='fieldSet'){ try{ setField(m.cls,m.name,m.h,m.type,m.val); send({t:'toast',msg:'field set'});}catch(e){send({t:'toast',msg:''+e});} }
+            else if(t==='fieldGet'){ try{ send({t:'fieldVal', ctx:m.ctx, val:readField(m.cls,m.name,m.h)});}catch(e){send({t:'fieldVal',ctx:m.ctx,val:''+e});} }
+            else if(t==='eval'){ try{ const r=(0,eval)(m.code); if(r!==undefined) console.log(''+r);}catch(e){console.log('ERROR '+e);} }
+            else if(t==='dump'){ require('./features').dumpDex(); }
+            else if(t==='record'){ require('./features').record(m.on,m.scope,state,getSt,ensure,maybeRemove); }
+            else if(t==='monitor'){ require('./features').monitor(m.on); }
+            else if(t==='settings'){ require('./features').setPublish(m.publish); }
+          }
+          module.exports = { init(ctx){ appCtx=ctx; }, dispatch:dispatch, handles:handles, getSt:getSt, ensure:ensure, maybeRemove:maybeRemove };
+          EOF_CORE
+          cat > agent/overlay.js <<'EOF_OVL'
+          const Java = require('frida-java-bridge');
+          let nf=null, overlayView=null, proxy=null, lastText='', imeShown=false, currentDecor=null;
+          function natives(){
+            if(nf) return nf;
+            const lib='libtool.so';
+            const get=n=>Module.getExportByName(lib,n);
+            nf={
+              surface:new NativeFunction(get('tool_surface'),'void',['pointer','int','int','float']),
+              resize:new NativeFunction(get('tool_surface_resize'),'void',['int','int']),
+              destroy:new NativeFunction(get('tool_surface_destroy'),'void',[]),
+              touch:new NativeFunction(get('tool_touch'),'int',['int','float','float']),
+              text:new NativeFunction(get('tool_text'),'void',['pointer']),
+              special:new NativeFunction(get('tool_special'),'void',['int']),
+              awFromSurface:new NativeFunction(Module.getExportByName('libandroid.so','ANativeWindow_fromSurface'),'pointer',['pointer','pointer'])
+            };
+            return nf;
+          }
+          function sendText(s){ const p=Memory.allocUtf8String(s); natives().text(p); }
+          function showIME(v,on){
+            if(on===imeShown) return; imeShown=on;
+            try {
+              const ctx=v.getContext();
+              const imm=Java.cast(ctx.getSystemService('input_method'),Java.use('android.view.inputmethod.InputMethodManager'));
+              if(on){ proxy.requestFocus(); imm.showSoftInput(proxy,0); }
+              else { imm.hideSoftInputFromWindow(v.getWindowToken(),0); proxy.clearFocus(); }
+            } catch(e){}
+          }
+          function attach(activity){
+            Java.performNow(()=>{
+              const N=natives();
+              const decor=activity.getWindow().getDecorView();
+              if(currentDecor===decor) return;
+              if(overlayView&&currentDecor){ try{ Java.cast(currentDecor,Java.use('android.view.ViewGroup')).removeView(overlayView); }catch(e){} }
+              currentDecor=decor;
+              const SurfaceView=Java.use('android.view.SurfaceView');
+              const view=SurfaceView.$new(activity);
+              view.setZOrderOnTop(true);
+              view.getHolder().setFormat(Java.use('android.graphics.PixelFormat').TRANSLUCENT.value);
+              const density=activity.getResources().getDisplayMetrics().density.value;
+              const env=Java.vm.getEnv().handle;
+              const CB=Java.registerClass({
+                name:'re.tool.SurfCB'+Date.now(),
+                implements:[Java.use('android.view.SurfaceHolder$Callback')],
+                methods:{
+                  surfaceCreated(h){
+                    const win=N.awFromSurface(env,h.getSurface().$h);
+                    const r=h.getSurfaceFrame();
+                    N.surface(win,r.width(),r.height(),density);
+                  },
+                  surfaceChanged(h,f,w,hh){ N.resize(w,hh); },
+                  surfaceDestroyed(h){ N.destroy(); }
+                }
+              });
+              view.getHolder().addCallback(CB.$new());
+              const Touch=Java.registerClass({
+                name:'re.tool.Touch'+Date.now(),
+                implements:[Java.use('android.view.View$OnTouchListener')],
+                methods:{
+                  onTouch(v,e){
+                    const a=e.getActionMasked();
+                    const r=N.touch(a,e.getX(),e.getY());
+                    if(a===0) showIME(v,(r&2)!==0);
+                    return (r&1)!==0;
+                  }
+                }
+              });
+              view.setOnTouchListener(Touch.$new());
+              // hidden EditText as IME proxy -> forwards typed text to ImGui
+              const EditText=Java.use('android.widget.EditText');
+              proxy=EditText.$new(activity);
+              proxy.setTextSize(1); proxy.setAlpha(0.0);
+              const Watcher=Java.registerClass({
+                name:'re.tool.Watch'+Date.now(),
+                implements:[Java.use('android.text.TextWatcher')],
+                methods:{
+                  beforeTextChanged(s,a,b,c){},
+                  onTextChanged(s,a,b,c){},
+                  afterTextChanged(editable){
+                    const s=''+editable.toString();
+                    if(s.length>lastText.length&&s.startsWith(lastText)){
+                      const add=s.substring(lastText.length);
+                      for(const ch of add){ if(ch==='\n') N.special(2); else sendText(ch); }
+                    } else if(s.length<lastText.length&&lastText.startsWith(s)){
+                      for(let i=0;i<lastText.length-s.length;i++) N.special(1);
+                    } else { sendText(s); }
+                    lastText=s;
+                  }
+                }
+              });
+              proxy.addTextChangedListener(Watcher.$new());
+              const LP=Java.use('android.widget.FrameLayout$LayoutParams');
+              const vg=Java.cast(decor,Java.use('android.view.ViewGroup'));
+              vg.addView(proxy,LP.$new(1,1));
+              vg.addView(view,LP.$new(-1,-1));
+              overlayView=view;
+            });
+          }
+          function start(app){
+            const CB=Java.registerClass({
+              name:'re.tool.Lifecycle'+Date.now(),
+              implements:[Java.use('android.app.Application$ActivityLifecycleCallbacks')],
+              methods:{
+                onActivityCreated(a,b){}, onActivityStarted(a){},
+                onActivityResumed(a){ attach(a); },
+                onActivityPaused(a){}, onActivityStopped(a){},
+                onActivitySaveInstanceState(a,b){},
+                onActivityDestroyed(a){}
+              }
+            });
+            app.registerActivityLifecycleCallbacks(CB.$new());
+          }
+          module.exports={start:start};
+          EOF_OVL
+          cat > agent/features.js <<'EOF_FEAT'
+          const Java = require('frida-java-bridge');
+          let ctxRef=null, dirPath='', publish=true;
+          let sslHooks=[], urlHook=null, recording=[], monitorOn=false;
+
+          function writeFile(name,bytes){
+            const File=Java.use('java.io.File');
+            const f=File.$new(dirPath,name);
+            const fos=Java.use('java.io.FileOutputStream').$new(f);
+            fos.write(bytes); fos.close();
+            return f.getAbsolutePath();
+          }
+          function publishToDownloads(name,path){
+            if(!publish) return;
+            try {
+              const Build=Java.use('android.os.Build$VERSION');
+              if(Build.SDK_INT.value>=29){
+                const CV=Java.use('android.content.ContentValues');
+                const cv=CV.$new();
+                cv.put('_display_name',name);
+                cv.put('mime_type','application/octet-stream');
+                const MS=Java.use('android.provider.MediaStore$Downloads');
+                const resolver=ctxRef.getContentResolver();
+                const uri=resolver.insert(MS.EXTERNAL_CONTENT_URI.value,cv);
+                if(uri!==null){
+                  const os=resolver.openOutputStream(uri);
+                  const fis=Java.use('java.io.FileInputStream').$new(path);
+                  const buf=Java.array('byte',new Array(8192).fill(0));
+                  let n; while((n=fis.read(buf))>0) os.write(buf,0,n);
+                  os.close(); fis.close();
+                }
+              }
+            } catch(e){}
+          }
+          function installJavaCrash(){
+            const prev=Java.use('java.lang.Thread').getDefaultUncaughtExceptionHandler();
+            const H=Java.registerClass({
+              name:'re.tool.Crash'+Date.now(),
+              implements:[Java.use('java.lang.Thread$UncaughtExceptionHandler')],
+              methods:{
+                uncaughtException(t,e){
+                  try {
+                    const Log=Java.use('android.util.Log');
+                    const s=Log.getStackTraceString(e);
+                    const p=writeFile('jcrash_'+Date.now()+'.txt',Java.array('byte',Array.from(s).map(c=>c.charCodeAt(0))));
+                    publishToDownloads(p.split('/').pop(),p);
+                  } catch(x){}
+                  if(prev!==null) prev.uncaughtException(t,e);
+                }
+              }
+            });
+            Java.use('java.lang.Thread').setDefaultUncaughtExceptionHandler(H.$new());
+          }
+          function dumpDex(){
+            const seen=new Set(); let count=0;
+            const ranges=Process.enumerateRanges('r--');
+            for(const r of ranges){
+              if(r.size>128*1024*1024) continue;
+              let hits=[];
+              try { hits=Memory.scanSync(r.base,r.size,'64 65 78 0a 30 33'); } catch(e){ continue; }
+              for(const h of hits){
+                const base=h.address;
+                if(seen.has(base.toString())) continue;
+                seen.add(base.toString());
+                try {
+                  const size=base.add(32).readU32();
+                  if(size<112||size>r.size) continue;
+                  const bytes=base.readByteArray(size);
+                  send({t:'dex', name:'classes_'+base+'.dex', size:size}, bytes);
+                  count++;
+                } catch(e){}
+              }
+            }
+            send({t:'toast', msg:'dumped '+count+' dex image(s)'});
+          }
+          function record(on,scope,state,getSt,ensure,maybeRemove){
+            if(on){
+              const names=Java.enumerateLoadedClassesSync().filter(n=>n.startsWith(scope)&&!n.startsWith('['));
+              let classes=0,methods=0;
+              for(const n of names){
+                if(classes>=300||methods>=3000) break;
+                try {
+                  const k=Java.use(n);
+                  const ms=k.class.getDeclaredMethods();
+                  const done=new Set();
+                  for(let i=0;i<ms.length;i++){
+                    const name=ms[i].getName();
+                    if(done.has(name)) continue; done.add(name);
+                    let ovs; try{ ovs=k[name].overloads; }catch(e){ continue; }
+                    for(let o=0;o<ovs.length;o++){
+                      if(methods>=3000) break;
+                      const st=getSt(n,name,o);
+                      if(!st.record){ st.record=true; ensure(st); recording.push(st); methods++; }
+                    }
+                  }
+                  classes++;
+                } catch(e){}
+              }
+              send({t:'toast', msg:'recording '+methods+' methods / '+classes+' classes (capped)'});
+            } else {
+              for(const st of recording){ st.record=false; maybeRemove(st); }
+              recording=[];
+              send({t:'toast', msg:'recorder stopped'});
+            }
+          }
+          function javaStack(){
+            try {
+              if(Java.vm.tryGetEnv()===null) return [];
+              let out=[];
+              Java.performNow(()=>{
+                const st=Java.use('java.lang.Thread').currentThread().getStackTrace();
+                for(let i=3;i<st.length&&out.length<8;i++){
+                  const f=st[i]; out.push({c:f.getClassName(), s:''+f});
+                }
+              });
+              return out;
+            } catch(e){ return []; }
+          }
+          function preview(buf,len){
+            const n=Math.min(len,512);
+            const bytes=new Uint8Array(buf.readByteArray(n));
+            let s='';
+            for(const b of bytes) s+=(b>=32&&b<127)?String.fromCharCode(b):'.';
+            return s;
+          }
+          function monitor(on){
+            monitorOn=on;
+            if(on){
+              const ssl=Process.findModuleByName('libssl.so');
+              if(ssl){
+                const getfd=new NativeFunction(ssl.getExportByName('SSL_get_fd'),'int',['pointer']);
+                const w=ssl.findExportByName('SSL_write');
+                const r=ssl.findExportByName('SSL_read');
+                if(w) sslHooks.push(Interceptor.attach(w,{
+                  onEnter(a){
+                    if(!monitorOn) return;
+                    const len=a[2].toInt32();
+                    send({t:'log', ch:'monitor', cls:'', name:'SSL_write',
+                      text:'-> fd'+getfd(a[0])+' '+len+'B',
+                      preview:preview(a[1],len), stack:javaStack()});
+                  }
+                }));
+                if(r) sslHooks.push(Interceptor.attach(r,{
+                  onEnter(a){ this.ssl=a[0]; this.buf=a[1]; },
+                  onLeave(ret){
+                    if(!monitorOn) return;
+                    const n=ret.toInt32(); if(n<=0) return;
+                    send({t:'log', ch:'monitor', cls:'', name:'SSL_read',
+                      text:'<- fd'+getfd(this.ssl)+' '+n+'B',
+                      preview:preview(this.buf,n), stack:javaStack()});
+                  }
+                }));
+              }
+              try {
+                const URL=Java.use('java.net.URL');
+                urlHook=URL.openConnection.overload().implementation=function(){
+                  if(monitorOn) send({t:'log', ch:'monitor', cls:'java.net.URL', name:'openConnection',
+                    text:'URL '+this.toString(), preview:this.toString(), stack:javaStack()});
+                  return this.openConnection();
+                };
+              } catch(e){}
+              send({t:'toast', msg:'monitor started (TLS plaintext + URL)'});
+            } else {
+              for(const h of sslHooks) Interceptor.detach(h);
+              sslHooks=[];
+              if(urlHook){ try{ Java.use('java.net.URL').openConnection.overload().implementation=null; }catch(e){} urlHook=null; }
+              send({t:'toast', msg:'monitor stopped'});
+            }
+          }
+          function init(ctx,dir){
+            ctxRef=ctx; dirPath=dir;
+            installJavaCrash();
+          }
+          module.exports={init:init, dumpDex:dumpDex, record:record, monitor:monitor,
+                          setPublish(p){ publish=p; }};
+          EOF_FEAT
+
+      # ============================================================
+      # 3) TEST APP + INJECTOR + README
+      # ============================================================
+      - name: Generate test app and tools
+        run: |
+          [ -f testapp/AndroidManifest.xml ] && exit 0
+          mkdir -p testapp/src/com/example/tooltest tools
+          cat > testapp/AndroidManifest.xml <<'EOF_MAN'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.example.tooltest">
+            <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34"/>
+            <application android:label="ToolTest" android:theme="@android:style/Theme.Material.Light">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF_MAN
+          cat > testapp/src/com/example/tooltest/MainActivity.java <<'EOF_JAVA'
+          package com.example.tooltest;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.widget.*;
+          public class MainActivity extends Activity {
+            public static String secret = "hello-static";
+            private int counter = 0;
+            static { System.loadLibrary("tool"); }
+            public String greet(String who, int times){ counter++; return "Hi " + who + " x" + times + " (#" + counter + ")"; }
+            public int add(int a, int b){ return a + b; }
+            public void logIt(String s){ android.util.Log.i("ToolTest", s); }
+            @Override protected void onCreate(Bundle b){
+              super.onCreate(b);
+              LinearLayout l = new LinearLayout(this); l.setOrientation(LinearLayout.VERTICAL);
+              TextView t = new TextView(this); t.setText("libtool test app - tap TOOL button");
+              EditText e = new EditText(this); e.setHint("name");
+              Button btn = new Button(this); btn.setText("Call greet()");
+              TextView out = new TextView(this);
+              btn.setOnClickListener(v -> { out.setText(greet(e.getText().toString(), add(2,3))); logIt(out.getText().toString()); });
+              l.addView(t); l.addView(e); l.addView(btn); l.addView(out);
+              setContentView(l);
+            }
+          }
+          EOF_JAVA
+          cat > tools/inject.py <<'EOF_INJ'
+          #!/usr/bin/env python3
+          """Inject libtool.so into any APK. Requires: apktool, zipalign, apksigner, java.
+          Usage: python3 inject.py app.apk --libs ./libs --out patched.apk
+          libs dir must contain arm64-v8a/libtool.so and/or armeabi-v7a/libtool.so"""
+          import argparse, os, re, shutil, subprocess, sys, tempfile, glob
+
+          def run(cmd): subprocess.check_call(cmd)
+
+          def main():
+            ap = argparse.ArgumentParser()
+            ap.add_argument('apk'); ap.add_argument('--libs', required=True)
+            ap.add_argument('--out', default='patched.apk')
+            ap.add_argument('--ks', default=os.path.expanduser('~/.android/debug.keystore'))
+            ap.add_argument('--ks-pass', default='android')
+            a = ap.parse_args()
+            work = tempfile.mkdtemp(prefix='toolinject_')
+            dec = os.path.join(work, 'dec')
+            run(['apktool', 'd', '-f', '-o', dec, a.apk])
+            # find launcher activity
+            man = open(os.path.join(dec, 'AndroidManifest.xml'), encoding='utf-8').read()
+            m = re.search(r'<activity[^>]*android:name="([^"]+)"[^>]*>(?:(?!</activity>).)*?LAUNCHER', man, re.S)
+            if not m:
+              m2 = re.search(r'<activity[^>]*android:name="([^"]+)"', man)
+              if not m2: sys.exit('no activity found')
+              name = m2.group(1)
+            else: name = m.group(1)
+            pkg = re.search(r'package="([^"]+)"', man).group(1)
+            if name.startswith('.'): name = pkg + name
+            smali = os.path.join(dec, 'smali*', *[])
+            cands = glob.glob(os.path.join(dec, 'smali*', name.replace('.', os.sep) + '.smali'))
+            if not cands: sys.exit('activity smali not found: ' + name)
+            path = cands[0]
+            src = open(path, encoding='utf-8').read()
+            inject = ('    const-string v0, "tool"\n'
+                      '    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n')
+            om = re.search(r'(\.method[^\n]*onCreate\(Landroid/os/Bundle;\)V.*?\.locals (\d+))', src, re.S)
+            if om:
+              locals_n = int(om.group(2))
+              if locals_n < 1:
+                src = src.replace(om.group(1), om.group(1).replace('.locals 0', '.locals 1'), 1)
+              idx = src.index(om.group(1)) + len(om.group(1))
+              src = src[:idx] + '\n' + inject + src[idx:]
+            else:
+              src += ('\n.method public onCreate(Landroid/os/Bundle;)V\n    .locals 1\n'
+                      + inject +
+                      '    invoke-super {p0, p1}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V\n'
+                      '    return-void\n.end method\n')
+            open(path, 'w', encoding='utf-8').write(src)
+            for abi in ('arm64-v8a', 'armeabi-v7a'):
+              so = os.path.join(a.libs, abi, 'libtool.so')
+              if os.path.exists(so):
+                dst = os.path.join(dec, 'lib', abi); os.makedirs(dst, exist_ok=True)
+                shutil.copy(so, dst)
+            built = os.path.join(work, 'built.apk')
+            run(['apktool', 'b', '-f', '-o', built, dec])
+            aligned = os.path.join(work, 'aligned.apk')
+            run(['zipalign', '-f', '4', built, aligned])
+            if not os.path.exists(a.ks):
+              run(['keytool', '-genkeypair', '-keystore', a.ks, '-alias', 'k', '-keyalg', 'RSA',
+                   '-keysize', '2048', '-validity', '10000', '-storepass', a.ks_pass,
+                   '-keypass', a.ks_pass, '-dname', 'CN=tool'])
+            run(['apksigner', 'sign', '--ks', a.ks, '--ks-pass', 'pass:' + a.ks_pass,
+                 '--out', a.out, aligned])
+            print('OK ->', a.out)
+
+          if __name__ == '__main__': main()
+          EOF_INJ
+          cat > README.md <<'EOF_README'
+          # libtool — in-app Frida-powered ImGui runtime toolbox (no root / no frida-server / no gadget)
+
+          One standalone `libtool.so`. Drop it into an APK's `lib/<abi>/`, add
+          `System.loadLibrary("tool")` to the main activity, rebuild, sign, install.
+          The ImGui menu renders on a translucent SurfaceView inside the app's own
+          window — **no overlay permission**.
+
+          ## How it works
+          - Embeds **frida-gum + GumJS (QuickJS)** devkit statically (the only part of
+            Frida we need — no frida-core, no server, no gadget, no root).
+          - Bundles **frida-java-bridge** into the agent via frida-compile.
+          - Java-side overlay/IME/lifecycle is done entirely from the agent
+            (`Java.registerClass`), so the .so is truly self-contained.
+          - UI: Dear ImGui (GLES3) on its own EGL surface + hidden EditText IME proxy.
+
+          ## Tabs
+          Settings / Patches / Hooks / Trackers / Dumper / Recorder / Monitor / Script / Classes.
+          Classes windows are isolated (own filters), `+` adds windows, class search by
+          class/method(name,return,param)/field(name,type), per-method Call/Patch/Track/Hook,
+          per-field value/Set/Patch(lock)/Track(watch), instance Find (Java.choose) / Create,
+          object-arg picker with find/create. Logs are clickable -> open caller class.
+
+          ## Build
+          Push `.github/workflows/tool.yml` to an empty repo and run the workflow.
+          Artifacts: `libtool-arm64-v8a.so`, `libtool-armeabi-v7a.so`, signed
+          `tooltest.apk`, `inject.py`, full sources (auto-committed on first run).
+
+          ## Inject into your own APK
+          python3 tools/inject.py app.apk --libs ./libs --out patched.apk
+          (needs apktool, zipalign, apksigner on PATH)
+
+          ## Crash logs & dumps
+          Written to `Android/data/<pkg>/files/tool/` (always accessible), and copied
+          to public **Downloads** via MediaStore on API 29+ (toggle in Settings).
+
+          ## Honest limitations / roadmap
+          - **Smali live edit = phase 2.** Plan: embed baksmali/smali (dexlib2) as a
+            dex payload loaded with InMemoryDexClassLoader; disassemble target class,
+            reassemble edited method, load and redirect via the hook dispatcher.
+            UI slot exists; Java(JS) and Noop modes work today.
+          - Field tracking is a 1s value-change watch (no ART field watchpoints).
+          - Recorder hooks all methods under a scope prefix (capped 300 classes /
+            3000 methods). Whole-app unbounded tracing is not practical in-process.
+          - `Java.choose` depends on frida-java-bridge heap walking; may fail on some
+            new ROMs. Monitor covers TLS plaintext + URL opens (OkHttp-specific
+            request/response enrichment is phase 2).
+          - If a pinned Frida devkit 404s, CI falls back to the latest 16.x release.
+            If the gum C API ever changes arity, build with
+            `-DCMAKE_CXX_FLAGS="-DGUM_CREATE_NO_SNAPSHOT -DGUM_POST_NO_DATA"`.
+
+          Use only on apps you own or are authorized to test.
+
+          ## Licenses
+          Frida/gum: wxWindows Library Licence. frida-java-bridge: MIT.
+          Dear ImGui: MIT. nlohmann/json: MIT. This repo: MIT.
+          EOF_README
+
+      - name: Commit generated sources
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || { git commit -m "Generate libtool sources [skip ci]"; git push; }
+
+      # ============================================================
+      # 4) TOOLCHAIN + DEPS
+      # ============================================================
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with: { ndk-version: r26d }
+
+      - name: Build agent.js
+        run: |
+          npm install --no-fund --no-audit frida-compile@^16 frida-java-bridge@^6
+          mkdir -p build/generated
+          npx frida-compile agent/index.js -o build/agent.js
+          (cd build && xxd -i agent.js > generated/agent_js.h)
+
+      - name: Fetch devkits / imgui / json
+        run: |
+          mkdir -p deps
+          V="$FRIDA_VERSION"
+          for ABI in arm64 arm; do
+            URL="https://github.com/frida/frida/releases/download/$V/frida-gumjs-devkit-$V-android-$ABI.tar.xz"
+            if ! curl -fL -o devkit-$ABI.tar.xz "$URL"; then
+              V=$(curl -fsSL "https://api.github.com/repos/frida/frida/releases?per_page=100" | jq -r '[.[].tag_name | select(startswith("16."))][0]')
+              URL="https://github.com/frida/frida/releases/download/$V/frida-gumjs-devkit-$V-android-$ABI.tar.xz"
+              curl -fL -o devkit-$ABI.tar.xz "$URL"
+            fi
+            mkdir -p deps/gum-$ABI
+            tar -xf devkit-$ABI.tar.xz -C deps/gum-$ABI
+          done
+          git clone --depth 1 --branch v1.90.9 https://github.com/ocornut/imgui deps/imgui
+          mkdir -p deps/json/nlohmann
+          curl -fL -o deps/json/nlohmann/json.hpp https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp
+
+      # ============================================================
+      # 5) NATIVE BUILD (both ABIs)
+      # ============================================================
+      - name: Build libtool.so
+        run: |
+          NDK="${{ steps.ndk.outputs.ndk-path }}"
+          for PAIR in "arm64-v8a:arm64" "armeabi-v7a:arm"; do
+            AABI="${PAIR%%:*}"; GABI="${PAIR##*:}"
+            cmake -S . -B build/$AABI \
+              -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+              -DANDROID_ABI=$AABI -DANDROID_PLATFORM=android-26 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DGUM_DIR=$GITHUB_WORKSPACE/deps/gum-$GABI \
+              -DIMGUI_DIR=$GITHUB_WORKSPACE/deps/imgui \
+              -DJSON_DIR=$GITHUB_WORKSPACE/deps/json \
+              -DGEN_DIR=$GITHUB_WORKSPACE/build/generated
+            cmake --build build/$AABI -j$(nproc)
+          done
+          mkdir -p out/libs/arm64-v8a out/libs/armeabi-v7a
+          cp build/arm64-v8a/libtool.so out/libs/arm64-v8a/
+          cp build/armeabi-v7a/libtool.so out/libs/armeabi-v7a/
+
+      # ============================================================
+      # 6) TEST APK (built + signed)
+      # ============================================================
+      - name: Build test APK
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-34" "build-tools;34.0.0" >/dev/null
+          BT=$ANDROID_HOME/build-tools/34.0.0
+          PJ=$ANDROID_HOME/platforms/android-34/android.jar
+          mkdir -p build/apk/obj
+          $BT/aapt2 link --manifest testapp/AndroidManifest.xml -I "$PJ" \
+            --min-sdk-version 26 --target-sdk-version 34 -o build/apk/base.apk
+          javac -source 8 -target 8 -bootclasspath "$PJ" -d build/apk/obj \
+            testapp/src/com/example/tooltest/MainActivity.java 2>/dev/null
+          $BT/d8 --release --min-api 26 --lib "$PJ" --output build/apk \
+            $(find build/apk/obj -name '*.class')
+          (cd build/apk && zip -j base.apk classes.dex)
+          cp -r out/libs build/apk/lib
+          (cd build/apk && zip -r base.apk lib)
+          $BT/zipalign -f 4 build/apk/base.apk build/apk/aligned.apk
+          keytool -genkeypair -keystore build/debug.keystore -alias k -keyalg RSA \
+            -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=tool"
+          $BT/apksigner sign --ks build/debug.keystore --ks-pass pass:android \
+            --key-pass pass:android --out out/tooltest.apk build/apk/aligned.apk
+
+      - name: Collect artifacts
+        run: |
+          cp tools/inject.py out/
+          cp README.md out/
+          cp out/libs/arm64-v8a/libtool.so out/libtool-arm64-v8a.so
+          cp out/libs/armeabi-v7a/libtool.so out/libtool-armeabi-v7a.so
+          zip -r out/sources.zip native agent testapp tools CMakeLists.txt README.md .github
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libtool-android
+          path: out/*
