@@ -1,13 +1,42 @@
-name: final-build
+name: final-build2
 on:
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fix test app lambda (no LambdaMetafactory needed)
+        run: |
+          python3 - <<'PY'
+          import sys
+          p='testapp/src/com/example/tooltest/MainActivity.java'
+          s=open(p,encoding='utf-8').read()
+          old='btn.setOnClickListener(v -> { out.setText(greet(e.getText().toString(), add(2,3))); logIt(out.getText().toString()); });'
+          new='''btn.setOnClickListener(new android.view.View.OnClickListener(){
+                @Override public void onClick(android.view.View v){
+                  out.setText(greet(e.getText().toString(), add(2,3)));
+                  logIt(out.getText().toString());
+                }
+              });'''
+          if old in s:
+              s=s.replace(old,new,1); print('patched lambda -> anonymous class')
+          elif 'new android.view.View.OnClickListener' in s:
+              print('already patched')
+          else:
+              print('MISS lambda line'); sys.exit(1)
+          s=s.replace('EditText e = new EditText(this);','final EditText e = new EditText(this);')
+          s=s.replace('TextView out = new TextView(this);','final TextView out = new TextView(this);')
+          open(p,'w',encoding='utf-8').write(s)
+          print('JAVA FIX OK')
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || { git commit -m "test app: avoid lambda for javac bootclasspath [skip ci]"; git push; }
 
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
@@ -65,21 +94,14 @@ jobs:
           name: libtool-libs
           path: out/libs/**
 
-      - name: Build test APK (use preinstalled SDK)
+      - name: Build test APK (stable SDK + anonymous class)
         run: |
           set -e
-          BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)
-          PJ=$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)
-          if [ -z "$BT" ] || [ -z "$PJ" ]; then
-            SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-            yes | "$SDKM" --licenses >/dev/null 2>&1 || true
-            "$SDKM" "platforms;android-34" "build-tools;34.0.0" || true
-            BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)
-            PJ=$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)
-          fi
-          [ -n "$BT" ] && [ -n "$PJ" ] || { echo "No Android SDK build-tools/platform found"; exit 1; }
-          BT="${BT%/}"
-          echo "Using BT=$BT"; echo "Using PJ=$PJ"
+          pick_bt(){ for v in 34.0.0 35.0.0 36.0.0; do [ -d "$ANDROID_HOME/build-tools/$v" ] && { echo "$ANDROID_HOME/build-tools/$v"; return; }; done; ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1; }
+          pick_pj(){ for v in 34 35 36; do [ -f "$ANDROID_HOME/platforms/android-$v/android.jar" ] && { echo "$ANDROID_HOME/platforms/android-$v/android.jar"; return; }; done; ls -d "$ANDROID_HOME"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1; }
+          BT=$(pick_bt); PJ=$(pick_pj)
+          [ -n "$BT" ] && [ -n "$PJ" ] || { echo "No Android SDK found"; exit 1; }
+          BT="${BT%/}"; echo "BT=$BT"; echo "PJ=$PJ"
           mkdir -p build/apk/obj
           "$BT/aapt2" link --manifest testapp/AndroidManifest.xml -I "$PJ" \
             --min-sdk-version 26 --target-sdk-version 34 -o build/apk/base.apk
