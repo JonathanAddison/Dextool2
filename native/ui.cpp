@@ -497,13 +497,18 @@ void draw(){
   ImGui::SetNextWindowPos(tpos,ImGuiCond_Always);
   ImGui::SetNextWindowBgAlpha(0.0f);
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
-  ImGui::Begin("##toggle",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoNav);
+  ImGui::Begin("##toggle",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoBackground|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoNav);
   ImVec2 sz(72,72);
   ImGui::InvisibleButton("##tgl",sz);
-  static bool dragging=false; static float moved=0;
-  if(ImGui::IsItemActivated()){ dragging=true; moved=0; }
-  if(dragging&&ImGui::IsMouseDown(0)){ ImVec2 d=io.MouseDelta; moved+=fabsf(d.x)+fabsf(d.y); tpos.x+=d.x; tpos.y+=d.y; }
-  if(dragging&&ImGui::IsMouseReleased(0)){ dragging=false; if(moved<6.0f) G.menuOpen=!G.menuOpen; }
+  static bool pressed=false, dragMode=false; static ImVec2 pressPos, startPos;
+  if(ImGui::IsItemActivated()){ pressed=true; dragMode=false; pressPos=io.MousePos; startPos=tpos; }
+  if(pressed&&ImGui::IsMouseDown(0)){
+    ImVec2 d(io.MousePos.x-pressPos.x, io.MousePos.y-pressPos.y);
+    float dist=fabsf(d.x)+fabsf(d.y);
+    if(dist>8.0f) dragMode=true;
+    if(dragMode){ tpos.x=startPos.x+d.x; tpos.y=startPos.y+d.y; }
+  }
+  if(pressed&&ImGui::IsMouseReleased(0)){ pressed=false; if(!dragMode) G.menuOpen=!G.menuOpen; dragMode=false; }
   ImDrawList* dl=ImGui::GetWindowDrawList();
   ImVec2 p=ImGui::GetItemRectMin();
   ImVec2 c(p.x+sz.x*0.5f,p.y+sz.y*0.5f);

@@ -42,6 +42,35 @@ function detach(){
   }); }catch(e){}
   overlayView=null; proxy=null; currentDecor=null; imeShown=false; lastText='';
 }
+let mainQueue=[], MainRunner=null;
+function runOnMain(fn){
+  mainQueue.push(fn);
+  if(!MainRunner){
+    MainRunner=Java.registerClass({name:'re.tool.MR'+Date.now(),
+      implements:[Java.use('java.lang.Runnable')],
+      methods:{ run(){ while(mainQueue.length){ const f=mainQueue.shift(); try{ f(); }catch(e){ diag('main err '+e); } } } }});
+  }
+  Java.use('android.os.Handler').$new(Java.use('android.os.Looper').getMainLooper()).post(MainRunner.$new());
+}
+function currentActivity(){
+  try{
+    const AT=Java.use('android.app.ActivityThread');
+    const at=AT.currentActivityThread();
+    const f=at.getClass().getDeclaredField('mActivities');
+    f.setAccessible(true);
+    const map=f.get(at);
+    const it=map.values().iterator();
+    const Activity=Java.use('android.app.Activity');
+    while(it.hasNext()){
+      const rec=it.next();
+      const rf=rec.getClass().getDeclaredField('activity');
+      rf.setAccessible(true);
+      const a=rf.get(rec);
+      if(a!==null){ const act=Java.cast(a,Activity); if(!act.isFinishing()) return Java.retain(act); }
+    }
+  }catch(e){ diag('currentActivity err '+e); }
+  return null;
+}
 function attach(activity){
   try{ Java.performNow(()=>{
     diag('attach');
@@ -129,7 +158,7 @@ function start(app){
       implements:[Java.use('android.app.Application$ActivityLifecycleCallbacks')],
       methods:{
         onActivityCreated(a,b){}, onActivityStarted(a){},
-        onActivityResumed(a){ attach(a); },
+        onActivityResumed(a){ const r=Java.retain(a); runOnMain(()=>attach(r)); },
         onActivityPaused(a){ detach(); },
         onActivityStopped(a){}, onActivitySaveInstanceState(a,b){},
         onActivityDestroyed(a){ detach(); }
@@ -137,12 +166,19 @@ function start(app){
     });
     app.registerActivityLifecycleCallbacks(LC.$new());
     diag('lifecycle registered');
-    try{
-      const at=Java.use('android.app.ActivityThread').currentActivityThread();
-      const it=at.mActivities.value.values().iterator();
-      while(it.hasNext()){ const rec=it.next(); const a=rec.activity.value;
-        if(a!==null&&!a.isFinishing()){ attach(a); break; } }
-    }catch(e){ diag('current activity skip '+e); }
+    const a=currentActivity();
+    if(a){ diag('current activity found'); runOnMain(()=>attach(a)); }
+    else diag('no current activity yet');
+    let n=0;
+    function retry(){
+      if(n++>=6) return;
+      Java.performNow(()=>{
+        const x=currentActivity();
+        if(x){ diag('retry found activity'); runOnMain(()=>attach(x)); }
+        else setTimeout(retry,300);
+      });
+    }
+    setTimeout(retry,300);
   }catch(e){ diag('start err '+e); }
 }
 export { start };
