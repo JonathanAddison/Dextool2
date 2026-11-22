@@ -42,6 +42,7 @@ static void renderMain(){
   ImFontConfig fc; fc.OversampleH=2;
   if(io.Fonts->Fonts.empty())
     io.Fonts->AddFontFromFileTTF("/system/fonts/Roboto-Regular.ttf",16.0f*d,&fc);
+  ImGui::GetStyle()=ImGuiStyle();
   ImGui::StyleColorsDark();
   ImGui::GetStyle().ScaleAllSizes(d*0.9f);
   ImGui_ImplOpenGL3_Init("#version 300 es");
@@ -51,8 +52,7 @@ static void renderMain(){
   while(g_run.load()){
     { std::lock_guard<std::mutex> lk(g_evMtx);
       for(auto& e:g_ev){
-        ImGui_ImplOpenGL3_NewFrame(); // no-op cost; keep io current below
-        io.AddMousePosEvent(e.x,e.y);
+                io.AddMousePosEvent(e.x,e.y);
         if(e.a==0) io.AddMouseButtonEvent(0,true);
         else if(e.a==1||e.a==3) io.AddMouseButtonEvent(0,false);
       }
