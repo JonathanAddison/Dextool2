@@ -15,6 +15,14 @@ function natives(){
   return NF;
 }
 function sendText(s){ const p=Memory.allocUtf8String(s); natives().text(p); }
+function jstrToJs(j){
+  if(typeof j==='string') return j;
+  try{
+    const b=j.getBytes('UTF-8'); const n=b.length; const u=new Uint8Array(n);
+    for(let i=0;i<n;i++){ let x=b[i]; if(x<0)x+=256; u[i]=x; }
+    return new TextDecoder().decode(u);
+  }catch(e){ return ''+j; }
+}
 function showIME(on){
   if(on===imeShown||!proxy) return; imeShown=on;
   try{
@@ -84,7 +92,7 @@ function attach(activity){
       methods:{
         beforeTextChanged(s,a,b,c){}, onTextChanged(s,a,b,c){},
         afterTextChanged(ed){ try{
-          const s=''+ed.toString();
+          const s=jstrToJs(ed.toString());
           if(s.length>lastText.length&&s.startsWith(lastText)){
             const add=s.substring(lastText.length);
             for(const ch of add){ if(ch==='\n') N.special(2); else sendText(ch); }
@@ -101,6 +109,16 @@ function attach(activity){
     vg.addView(proxy,LP.$new(1,1));
     vg.addView(v,LP.$new(-1,-1));
     overlayView=v;
+    try{
+      v.setVisibility(Java.use('android.view.View').VISIBLE.value);
+      v.bringToFront(); v.requestLayout(); v.invalidate();
+      decor.requestLayout(); decor.invalidate();
+      const Kick=Java.registerClass({name:'re.tool.Kick'+Date.now(),
+        implements:[Java.use('java.lang.Runnable')],
+        methods:{ run(){ try{ v.requestLayout(); v.invalidate(); decor.requestLayout(); decor.invalidate(); }catch(e){} } }});
+      Java.use('android.os.Handler').$new(Java.use('android.os.Looper').getMainLooper())
+        .postDelayed(Kick.$new(),300);
+    }catch(e){}
     diag('attached');
   }); }catch(e){ diag('attach err '+e); }
 }

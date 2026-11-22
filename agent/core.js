@@ -47,13 +47,16 @@ function stack(){
   } catch(e){ return []; }
 }
 function logCall(st,args,ret,phase){
-  const ch = st.track ? 'track' : 'record';
-  const id = st.track ? st.trackId : key(st.cls,st.name,st.ov);
-  const a = args.map(safeStr).join(', ');
-  const text = phase==='exit'
-    ? st.cls+'.'+st.name+'('+a+') -> '+safeStr(ret)
-    : st.cls+'.'+st.name+'('+a+')';
-  send({t:'log', ch:ch, id:id, cls:st.cls, name:st.name, text:text, stack:stack()});
+  try{
+    const ch = st.track ? 'track' : 'record';
+    const id = st.track ? st.trackId : key(st.cls,st.name,st.ov);
+    const a = args.map(safeStr).join(', ');
+    const text = phase==='exit'
+      ? st.cls+'.'+st.name+'('+a+') -> '+safeStr(ret)
+      : st.cls+'.'+st.name+'('+a+')';
+    const stk = (ch==='track') ? stack() : [];
+    send({t:'log', ch:ch, id:id, cls:st.cls, name:st.name, text:text, stack:stk});
+  }catch(e){}
 }
 function ensure(st){
   if(st.installed) return;
@@ -63,7 +66,7 @@ function ensure(st){
     if(st.patch && st.patch.enabled && !st.patch.isField)
       a = args.map((v,i)=>dec(st.patch.args[i], st.types[i], v));
     const tracing = (st.track&&st.trackOn)||st.record;
-    if(tracing) logCall(st,a,null,'enter');
+    if(st.track&&st.trackOn) logCall(st,a,null,'enter');
     let r;
     if(st.hook && st.hook.enabled){
       if(st.hook.mode==='noop') r = defRet(st.ret);

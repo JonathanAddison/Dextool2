@@ -4,6 +4,7 @@
 #include <imgui_stdlib.h>
 #include <algorithm>
 #include <fstream>
+#include <cmath>
 void toolSetDir(const std::string&);
 static int req(){ return G.nextReq++; }
 static ImU32 typeCol(const std::string& t){
@@ -105,12 +106,18 @@ static void drawStack(const std::vector<StackFrame>& st){
     if(ImGui::Selectable(f.s.c_str())) openClass(f.c);
     ImGui::PopStyleColor(); }
 }
+static LogEntry g_detail; static bool g_detailOpen=false;
 static void drawLog(std::deque<LogEntry>& log,bool openCls){
   ImGui::BeginChild("##log",ImVec2(-1,220),true);
-  for(auto& e:log){
-    if(openCls&&!e.cls.empty()){ if(ImGui::Selectable(e.text.c_str())) openClass(e.cls); }
-    else ImGui::TextWrapped("%s",e.text.c_str());
-    drawStack(e.stack);
+  int n=(int)log.size(); int start=std::max(0,n-150);
+  for(int i=start;i<n;i++){
+    auto& e=log[i];
+    ImGui::PushID(i);
+    if(ImGui::Selectable(e.text.c_str())){
+      if(openCls&&!e.cls.empty()) openClass(e.cls);
+      else if(!e.stack.empty()){ g_detail=e; g_detailOpen=true; }
+    }
+    ImGui::PopID();
   }
   if(ImGui::GetScrollY()>=ImGui::GetScrollMaxY()-4) ImGui::SetScrollHereY(1.0f);
   ImGui::EndChild();
@@ -486,10 +493,31 @@ void draw(){
   flushOpen();
   ImGuiIO& io=ImGui::GetIO();
   io.FontGlobalScale=G.cfg.fontScale;
-  ImGui::SetNextWindowPos(ImVec2(8,140),ImGuiCond_FirstUseEver);
-  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(6,6));
+  static ImVec2 tpos(12,160);
+  ImGui::SetNextWindowPos(tpos,ImGuiCond_Always);
+  ImGui::SetNextWindowBgAlpha(0.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
   ImGui::Begin("##toggle",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoNav);
-  if(ImGui::Button(G.menuOpen?"X":"TOOL")) G.menuOpen=!G.menuOpen;
+  ImVec2 sz(72,72);
+  ImGui::InvisibleButton("##tgl",sz);
+  static bool dragging=false; static float moved=0;
+  if(ImGui::IsItemActivated()){ dragging=true; moved=0; }
+  if(dragging&&ImGui::IsMouseDown(0)){ ImVec2 d=io.MouseDelta; moved+=fabsf(d.x)+fabsf(d.y); tpos.x+=d.x; tpos.y+=d.y; }
+  if(dragging&&ImGui::IsMouseReleased(0)){ dragging=false; if(moved<6.0f) G.menuOpen=!G.menuOpen; }
+  ImDrawList* dl=ImGui::GetWindowDrawList();
+  ImVec2 p=ImGui::GetItemRectMin();
+  ImVec2 c(p.x+sz.x*0.5f,p.y+sz.y*0.5f);
+  float t=(float)ImGui::GetTime();
+  float pulse=0.5f+0.5f*sinf(t*2.5f);
+  float r=30.0f;
+  ImVec2 a(c.x,c.y-r), b(c.x-r*0.87f,c.y+r*0.5f), cc(c.x+r*0.87f,c.y+r*0.5f);
+  dl->AddTriangle(a,b,cc,IM_COL32(0,255,150,(int)(70+120*pulse)),3.0f+2.0f*pulse);
+  dl->AddTriangle(a,b,cc,IM_COL32(0,168,107,255),1.5f);
+  float br=14.0f+2.0f*pulse;
+  dl->AddCircleFilled(c,br+4.0f,IM_COL32(200,80,255,(int)(90+150*pulse)),32);
+  dl->AddCircleFilled(c,br,IM_COL32(160,32,240,255),32);
+  dl->AddCircle(c,br,IM_COL32(255,255,255,200),32,1.5f);
+  dl->AddText(ImVec2(c.x-5,c.y-7),IM_COL32(255,255,255,255),"T");
   ImGui::End(); ImGui::PopStyleVar();
   if(G.menuOpen){
     ImGui::SetNextWindowSize(ImVec2(std::min(520.0f,io.DisplaySize.x-16),std::min(700.0f,io.DisplaySize.y-60)),ImGuiCond_FirstUseEver);
@@ -509,6 +537,12 @@ void draw(){
       ImGui::EndTabBar();
     }
     ImGui::End();
+  }
+  if(g_detailOpen){ ImGui::OpenPopup("Call stack"); g_detailOpen=false; }
+  if(ImGui::BeginPopupModal("Call stack",nullptr,ImGuiWindowFlags_AlwaysAutoResize)){
+    for(auto& f:g_detail.stack){ if(ImGui::Selectable(f.s.c_str())){ openClass(f.c); ImGui::CloseCurrentPopup(); } }
+    if(ImGui::Button("Close")) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
   }
   float y=io.DisplaySize.y-30;
   for(auto it=G.toasts.begin();it!=G.toasts.end();){
