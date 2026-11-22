@@ -73,8 +73,8 @@ jobs:
               send({t:'log', ch:ch, id:id, cls:st.cls, name:st.name, text:text, stack:stk});
             }catch(e){}
           }""")
-          rep('agent/core.js','if(tracing) logCall(st,a,null,'enter');',
-              'if(st.track&&st.trackOn) logCall(st,a,null,'enter');')
+          rep('agent/core.js',"if(tracing) logCall(st,a,null,'enter');",
+              "if(st.track&&st.trackOn) logCall(st,a,null,'enter');")
 
           # ---- ui: cmath ----
           rep('native/ui.cpp','#include <fstream>','#include <fstream>\n#include <cmath>')
