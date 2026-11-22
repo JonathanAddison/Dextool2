@@ -1,4 +1,4 @@
-name: stage0b-native-window
+name: stage1-full
 on:
   workflow_dispatch:
 permissions:
@@ -9,8 +9,312 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Move ANativeWindow acquisition into native
+      - name: Restore full agent + robust overlay/IME + chunked recorder + renderer fixes
         run: |
+          cp agent/index.full.js agent/index.js
+          python3 - <<'PY'
+          s=open('agent/index.js',encoding='utf-8').read()
+          if "import './polyfill.js';" not in s:
+              open('agent/index.js','w',encoding='utf-8').write("import './polyfill.js';\n"+s)
+              print('polyfill prepended')
+          PY
+
+          cat > agent/overlay.js <<'EOF_OVL'
+          import Java from 'frida-java-bridge';
+          function diag(m){ try{ send({t:'diag',msg:'overlay: '+m}); }catch(e){} }
+          let NF=null, overlayView=null, proxy=null, currentDecor=null, lastText='', imeShown=false;
+          function natives(){
+            if(NF) return NF;
+            const g=n=>Module.getExportByName('libtool.so',n);
+            NF={
+              surfaceJava:new NativeFunction(g('tool_surface_from_java'),'void',['pointer','int','int','float']),
+              resize:new NativeFunction(g('tool_surface_resize'),'void',['int','int']),
+              destroy:new NativeFunction(g('tool_surface_destroy'),'void',[]),
+              touch:new NativeFunction(g('tool_touch'),'int',['int','float','float']),
+              text:new NativeFunction(g('tool_text'),'void',['pointer']),
+              special:new NativeFunction(g('tool_special'),'void',['int'])
+            };
+            return NF;
+          }
+          function sendText(s){ const p=Memory.allocUtf8String(s); natives().text(p); }
+          function showIME(on){
+            if(on===imeShown||!proxy) return; imeShown=on;
+            try{
+              const imm=Java.cast(proxy.getContext().getSystemService('input_method'),
+                Java.use('android.view.inputmethod.InputMethodManager'));
+              if(on){ proxy.setFocusableInTouchMode(true); proxy.requestFocus(); imm.showSoftInput(proxy,0); }
+              else { imm.hideSoftInputFromWindow(proxy.getWindowToken(),0); proxy.clearFocus(); }
+            }catch(e){ diag('IME err '+e); }
+          }
+          function detach(){
+            try{ Java.performNow(()=>{
+              if(currentDecor){
+                const vg=Java.cast(currentDecor,Java.use('android.view.ViewGroup'));
+                if(overlayView) vg.removeView(overlayView);
+                if(proxy) vg.removeView(proxy);
+              }
+            }); }catch(e){}
+            overlayView=null; proxy=null; currentDecor=null; imeShown=false; lastText='';
+          }
+          function attach(activity){
+            try{ Java.performNow(()=>{
+              diag('attach');
+              detach();
+              const N=natives();
+              const decor=activity.getWindow().getDecorView();
+              currentDecor=decor;
+              activity.getWindow().setSoftInputMode(
+                Java.use('android.view.WindowManager$LayoutParams').SOFT_INPUT_ADJUST_RESIZE.value);
+              const SV=Java.use('android.view.SurfaceView');
+              const v=SV.$new(activity);
+              v.setZOrderOnTop(true);
+              v.getHolder().setFormat(Java.use('android.graphics.PixelFormat').TRANSLUCENT.value);
+              const density=activity.getResources().getDisplayMetrics().density.value;
+              const CB=Java.registerClass({
+                name:'re.tool.CB'+Date.now(),
+                implements:[Java.use('android.view.SurfaceHolder$Callback')],
+                methods:{
+                  surfaceCreated(h){ try{
+                    const s=h.getSurface(); const r=h.getSurfaceFrame();
+                    diag('surface '+r.width()+'x'+r.height());
+                    N.surfaceJava(s.$h,r.width(),r.height(),density);
+                  }catch(e){ diag('surfaceCreated err '+e); } },
+                  surfaceChanged(h,f,w,hh){ N.resize(w,hh); },
+                  surfaceDestroyed(h){ diag('surfaceDestroyed'); N.destroy(); }
+                }
+              });
+              v.getHolder().addCallback(CB.$new());
+              const T=Java.registerClass({
+                name:'re.tool.T'+Date.now(),
+                implements:[Java.use('android.view.View$OnTouchListener')],
+                methods:{ onTouch(v,e){
+                  const a=e.getActionMasked(); const r=N.touch(a,e.getX(),e.getY());
+                  if(a===0) showIME((r&2)!==0);
+                  return (r&1)!==0;
+                } }
+              });
+              v.setOnTouchListener(T.$new());
+              const ET=Java.use('android.widget.EditText');
+              proxy=ET.$new(activity);
+              proxy.setTextSize(1); proxy.setAlpha(0.0);
+              proxy.setFocusable(true); proxy.setFocusableInTouchMode(true);
+              const IT=Java.use('android.text.InputType');
+              proxy.setInputType(IT.TYPE_CLASS_TEXT.value | IT.TYPE_TEXT_FLAG_NO_SUGGESTIONS.value);
+              const W=Java.registerClass({
+                name:'re.tool.W'+Date.now(),
+                implements:[Java.use('android.text.TextWatcher')],
+                methods:{
+                  beforeTextChanged(s,a,b,c){}, onTextChanged(s,a,b,c){},
+                  afterTextChanged(ed){ try{
+                    const s=''+ed.toString();
+                    if(s.length>lastText.length&&s.startsWith(lastText)){
+                      const add=s.substring(lastText.length);
+                      for(const ch of add){ if(ch==='\n') N.special(2); else sendText(ch); }
+                    } else if(s.length<lastText.length&&lastText.startsWith(s)){
+                      for(let i=0;i<lastText.length-s.length;i++) N.special(1);
+                    } else { sendText(s); }
+                    lastText=s;
+                  }catch(e){} }
+                }
+              });
+              proxy.addTextChangedListener(W.$new());
+              const LP=Java.use('android.widget.FrameLayout$LayoutParams');
+              const vg=Java.cast(decor,Java.use('android.view.ViewGroup'));
+              vg.addView(proxy,LP.$new(1,1));
+              vg.addView(v,LP.$new(-1,-1));
+              overlayView=v;
+              diag('attached');
+            }); }catch(e){ diag('attach err '+e); }
+          }
+          function start(app){
+            try{
+              const LC=Java.registerClass({
+                name:'re.tool.LC'+Date.now(),
+                implements:[Java.use('android.app.Application$ActivityLifecycleCallbacks')],
+                methods:{
+                  onActivityCreated(a,b){}, onActivityStarted(a){},
+                  onActivityResumed(a){ attach(a); },
+                  onActivityPaused(a){ detach(); },
+                  onActivityStopped(a){}, onActivitySaveInstanceState(a,b){},
+                  onActivityDestroyed(a){ detach(); }
+                }
+              });
+              app.registerActivityLifecycleCallbacks(LC.$new());
+              diag('lifecycle registered');
+              try{
+                const at=Java.use('android.app.ActivityThread').currentActivityThread();
+                const it=at.mActivities.value.values().iterator();
+                while(it.hasNext()){ const rec=it.next(); const a=rec.activity.value;
+                  if(a!==null&&!a.isFinishing()){ attach(a); break; } }
+              }catch(e){ diag('current activity skip '+e); }
+            }catch(e){ diag('start err '+e); }
+          }
+          export { start };
+          EOF_OVL
+
+          cat > agent/features.js <<'EOF_FEAT'
+          import Java from 'frida-java-bridge';
+          let ctxRef=null, dirPath='', publish=true;
+          let sslHooks=[], urlHook=null, recording=[], recordTimer=null;
+          function D(m){ try{ send({t:'diag',msg:'features: '+m}); }catch(e){} }
+          function writeFile(name,bytes){
+            const f=Java.use('java.io.File').$new(dirPath,name);
+            const fos=Java.use('java.io.FileOutputStream').$new(f);
+            fos.write(bytes); fos.close(); return f.getAbsolutePath();
+          }
+          function publishToDownloads(name,path){
+            if(!publish) return;
+            try{
+              if(Java.use('android.os.Build$VERSION').SDK_INT.value>=29){
+                const cv=Java.use('android.content.ContentValues').$new();
+                cv.put('_display_name',name); cv.put('mime_type','text/plain');
+                const uri=ctxRef.getContentResolver().insert(
+                  Java.use('android.provider.MediaStore$Downloads').EXTERNAL_CONTENT_URI.value,cv);
+                if(uri!==null){
+                  const os=ctxRef.getContentResolver().openOutputStream(uri);
+                  const fis=Java.use('java.io.FileInputStream').$new(path);
+                  const buf=Java.array('byte',new Array(8192).fill(0));
+                  let n; while((n=fis.read(buf))>0) os.write(buf,0,n);
+                  os.close(); fis.close();
+                }
+              }
+            }catch(e){}
+          }
+          function installJavaCrash(){
+            const prev=Java.use('java.lang.Thread').getDefaultUncaughtExceptionHandler();
+            const H=Java.registerClass({
+              name:'re.tool.Crash'+Date.now(),
+              implements:[Java.use('java.lang.Thread$UncaughtExceptionHandler')],
+              methods:{ uncaughtException(t,e){
+                try{
+                  const s=Java.use('android.util.Log').getStackTraceString(e);
+                  const p=writeFile('jcrash_'+Date.now()+'.txt',
+                    Java.array('byte',Array.from(s).map(c=>c.charCodeAt(0))));
+                  publishToDownloads(p.split('/').pop(),p);
+                }catch(x){}
+                if(prev!==null) prev.uncaughtException(t,e);
+              } }
+            });
+            Java.use('java.lang.Thread').setDefaultUncaughtExceptionHandler(H.$new());
+          }
+          function dumpDex(){
+            const seen=new Set(); let count=0;
+            for(const r of Process.enumerateRanges('r--')){
+              if(r.size>128*1024*1024) continue;
+              let hits=[]; try{ hits=Memory.scanSync(r.base,r.size,'64 65 78 0a 30 33'); }catch(e){ continue; }
+              for(const h of hits){
+                const base=h.address;
+                if(seen.has(base.toString())) continue; seen.add(base.toString());
+                try{
+                  const size=base.add(32).readU32();
+                  if(size<112||size>r.size) continue;
+                  send({t:'dex', name:'classes_'+base+'.dex', size:size}, base.readByteArray(size));
+                  count++;
+                }catch(e){}
+              }
+            }
+            send({t:'toast', msg:'dumped '+count+' dex image(s)'});
+          }
+          function record(on,scope,state,getSt,ensure,maybeRemove){
+            if(on){
+              D('record scanning scope='+scope);
+              const names=[];
+              Java.enumerateLoadedClasses({
+                onMatch(n){ if(n.startsWith(scope)&&!n.startsWith('[')&&names.length<200) names.push(n); },
+                onComplete(){
+                  let idx=0, classes=0, methods=0;
+                  function step(){
+                    Java.performNow(()=>{
+                      const end=Math.min(idx+20,names.length);
+                      for(;idx<end;idx++){
+                        const n=names[idx];
+                        try{
+                          const k=Java.use(n);
+                          const ms=k.class.getDeclaredMethods();
+                          const done=new Set();
+                          for(let i=0;i<ms.length;i++){
+                            const name=ms[i].getName();
+                            if(done.has(name)) continue; done.add(name);
+                            let ovs; try{ ovs=k[name].overloads; }catch(e){ continue; }
+                            for(let o=0;o<ovs.length;o++){
+                              if(methods>=2000) break;
+                              const st=getSt(n,name,o);
+                              if(!st.record){ st.record=true; ensure(st); recording.push(st); methods++; }
+                            }
+                          }
+                          classes++;
+                        }catch(e){}
+                      }
+                    });
+                    if(idx<names.length&&methods<2000) recordTimer=setTimeout(step,0);
+                    else { send({t:'toast',msg:'recording '+methods+' methods / '+classes+' classes'});
+                           D('record started methods='+methods); }
+                  }
+                  step();
+                }
+              });
+            } else {
+              if(recordTimer){ clearTimeout(recordTimer); recordTimer=null; }
+              for(const st of recording){ st.record=false; maybeRemove(st); }
+              recording=[];
+              send({t:'toast', msg:'recorder stopped'}); D('record stopped');
+            }
+          }
+          function javaStack(){
+            try{
+              if(Java.vm.tryGetEnv()===null) return [];
+              let out=[];
+              Java.performNow(()=>{
+                const st=Java.use('java.lang.Thread').currentThread().getStackTrace();
+                for(let i=3;i<st.length&&out.length<8;i++){ const f=st[i]; out.push({c:f.getClassName(), s:''+f}); }
+              });
+              return out;
+            }catch(e){ return []; }
+          }
+          function preview(buf,len){
+            const n=Math.min(len,512);
+            const bytes=new Uint8Array(buf.readByteArray(n));
+            let s=''; for(const b of bytes) s+=(b>=32&&b<127)?String.fromCharCode(b):'.';
+            return s;
+          }
+          function monitor(on){
+            if(on){
+              const ssl=Process.findModuleByName('libssl.so');
+              if(ssl){
+                const getfd=new NativeFunction(ssl.getExportByName('SSL_get_fd'),'int',['pointer']);
+                const w=ssl.findExportByName('SSL_write'), r=ssl.findExportByName('SSL_read');
+                if(w) sslHooks.push(Interceptor.attach(w,{ onEnter(a){
+                  const len=a[2].toInt32();
+                  send({t:'log',ch:'monitor',cls:'',name:'SSL_write',text:'-> fd'+getfd(a[0])+' '+len+'B',
+                    preview:preview(a[1],len),stack:javaStack()});
+                }}));
+                if(r) sslHooks.push(Interceptor.attach(r,{
+                  onEnter(a){ this.ssl=a[0]; this.buf=a[1]; },
+                  onLeave(ret){ const n=ret.toInt32(); if(n<=0) return;
+                    send({t:'log',ch:'monitor',cls:'',name:'SSL_read',text:'<- fd'+getfd(this.ssl)+' '+n+'B',
+                      preview:preview(this.buf,n),stack:javaStack()});
+                  }}));
+              }
+              try{
+                const URL=Java.use('java.net.URL');
+                urlHook=URL.openConnection.overload().implementation=function(){
+                  send({t:'log',ch:'monitor',cls:'java.net.URL',name:'openConnection',
+                    text:'URL '+this.toString(),preview:this.toString(),stack:javaStack()});
+                  return this.openConnection();
+                };
+              }catch(e){}
+              send({t:'toast',msg:'monitor started'}); D('monitor started');
+            } else {
+              for(const h of sslHooks) Interceptor.detach(h); sslHooks=[];
+              if(urlHook){ try{ Java.use('java.net.URL').openConnection.overload().implementation=null; }catch(e){} urlHook=null; }
+              send({t:'toast',msg:'monitor stopped'}); D('monitor stopped');
+            }
+          }
+          function init(ctx,dir){ ctxRef=ctx; dirPath=dir; installJavaCrash(); }
+          function setPublish(p){ publish=p; }
+          export { init, dumpDex, record, monitor, setPublish };
+          EOF_FEAT
+
           python3 - <<'PY'
           import sys
           def rep(path,old,new):
@@ -21,57 +325,20 @@ jobs:
                   print('already',path)
               else:
                   print('MISS',path,repr(old[:70])); sys.exit(1)
-
-          rep('native/diag.h','void init(JavaVM* vm);','void init(JavaVM* vm);\n  JavaVM* vm();')
-          rep('native/diag.cpp','std::string dir(){ return g_dir; }',
-              'std::string dir(){ return g_dir; }\nJavaVM* vm(){ return g_vm; }')
-          rep('native/exports.map','tool_surface;','tool_surface; tool_surface_from_java;')
-
-          newfn='''extern "C" __attribute__((visibility("default")))
-          void tool_surface_from_java(void* surface,int w,int h,float density){
-            diag::log("tool_surface_from_java surface=%p %dx%d d=%.2f",surface,w,h,density);
-            JavaVM* vm=diag::vm();
-            if(!vm){ diag::log("FAIL no JavaVM"); return; }
-            JNIEnv* env=nullptr;
-            if(vm->GetEnv((void**)&env,JNI_VERSION_1_6)!=0||!env){ diag::log("FAIL GetEnv"); return; }
-            ANativeWindow* win=ANativeWindow_fromSurface(env,(jobject)surface);
-            if(!win){ diag::log("FAIL ANativeWindow_fromSurface null"); return; }
-            diag::log("ANativeWindow=%p",win);
-            tool_surface(win,w,h,density);
-          }
-          '''
+          # renderer: remove stray backend NewFrame inside event drain
           rep('native/renderer.cpp',
-              'extern "C" __attribute__((visibility("default")))\nvoid tool_surface_resize(int w,int h){',
-              newfn+'extern "C" __attribute__((visibility("default")))\nvoid tool_surface_resize(int w,int h){')
-
-          # smoke agent: use native helper + granular probes
-          rep('agent/index.js',
-              "surface:new NativeFunction(g('tool_surface'),'void',['pointer','int','int','float']),",
-              "surface:new NativeFunction(g('tool_surface'),'void',['pointer','int','int','float']),\n              surfaceJava:new NativeFunction(g('tool_surface_from_java'),'void',['pointer','int','int','float']),")
-          old="""surfaceCreated(h){ try{
-                      const win=N.aw(env,h.getSurface().$h);
-                      const r=h.getSurfaceFrame();
-                      D('PASS surfaceCreated '+r.width()+'x'+r.height());
-                      N.surface(win,r.width(),r.height(),density);
-                      D('PASS tool_surface called');
-                    }catch(e){ D('FAIL surfaceCreated '+e); } },"""
-          new="""surfaceCreated(h){ try{
-                      D('sc: getSurface');
-                      const s=h.getSurface();
-                      if(s.$h===undefined||s.$h===null){ D('FAIL surface handle missing'); return; }
-                      D('sc: surface handle='+s.$h);
-                      const r=h.getSurfaceFrame();
-                      D('sc: frame '+r.width()+'x'+r.height());
-                      N.surfaceJava(s.$h,r.width(),r.height(),density);
-                      D('PASS tool_surface called');
-                    }catch(e){ D('FAIL surfaceCreated '+e); } },"""
-          rep('agent/index.js',old,new)
-          print('PATCHES OK')
+              'ImGui_ImplOpenGL3_NewFrame(); // no-op cost; keep io current below\n','')
+          # renderer: reset style before scaling (avoid cumulative scale on surface recreate)
+          rep('native/renderer.cpp',
+              'ImGui::StyleColorsDark();\n  ImGui::GetStyle().ScaleAllSizes(d*0.9f);',
+              'ImGui::GetStyle()=ImGuiStyle();\n  ImGui::StyleColorsDark();\n  ImGui::GetStyle().ScaleAllSizes(d*0.9f);')
+          print('RENDERER FIXES OK')
           PY
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add native agent
-          git diff --cached --quiet || { git commit -m "stage0b: acquire ANativeWindow in native via stored JavaVM [skip ci]"; git push; }
+          git add agent native
+          git diff --cached --quiet || { git commit -m "stage1: full agent, robust overlay lifecycle+IME, chunked recorder, renderer fixes [skip ci]"; git push; }
 
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
@@ -79,13 +346,13 @@ jobs:
         id: ndk
         with: { ndk-version: r26d }
 
-      - name: Bundle smoke agent + verify
+      - name: Bundle full agent + verify
         run: |
           npm init -y >/dev/null
           node -e "const p=require('./package.json');p.type='module';require('fs').writeFileSync('package.json',JSON.stringify(p,null,2))"
           npm install --no-fund --no-audit frida-compile@^16 frida-java-bridge@^6 esbuild buffer@^6
           mkdir -p build/generated
-          verify(){ node --check build/agent.js && node -e "const s=require('fs').readFileSync('build/agent.js','utf8'); if(s.length<50000){console.error('too small '+s.length);process.exit(1)} if(/^\s*(import|export)[ {]/m.test(s)||/^\s*const .*=\s*require\(/m.test(s)||/^\s*require\(/m.test(s)){console.error('unbundled statements remain');process.exit(1)} if(!s.includes('Buffer')||!s.includes('SMOKE')){console.error('marker missing');process.exit(1)} console.log('bundle verified bytes='+s.length);"; }
+          verify(){ node --check build/agent.js && node -e "const s=require('fs').readFileSync('build/agent.js','utf8'); if(s.length<50000){console.error('too small '+s.length);process.exit(1)} if(/^\s*(import|export)[ {]/m.test(s)||/^\s*const .*=\s*require\(/m.test(s)||/^\s*require\(/m.test(s)){console.error('unbundled statements remain');process.exit(1)} if(!s.includes('Buffer')){console.error('Buffer missing');process.exit(1)} console.log('bundle verified bytes='+s.length);"; }
           npx frida-compile agent/index.js -o build/agent.js 2>build/fc.log || true
           if ! verify; then
             echo "frida-compile invalid/failed:"; tail -20 build/fc.log || true
@@ -156,7 +423,7 @@ jobs:
       - name: Upload clean artifact (3 files only)
         uses: actions/upload-artifact@v4
         with:
-          name: libtool-stage0b
+          name: libtool-stage1
           path: |
             out/tooltest.apk
             out/libtool-arm64-v8a.so
