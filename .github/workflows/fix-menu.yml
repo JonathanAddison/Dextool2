@@ -1,4 +1,4 @@
-name: stage2-fixes
+name: stage3-fixes
 on:
   workflow_dispatch:
 permissions:
@@ -9,152 +9,110 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fix IME text + first-show + recorder contention + neon toggle
+      - name: Fix first-show (current activity + main thread) + toggle click/border
         run: |
           python3 - <<'PY'
-          import sys
-          def rep(path,old,new):
-              s=open(path,encoding='utf-8').read()
-              if old in s:
-                  open(path,'w',encoding='utf-8').write(s.replace(old,new,1)); print('patched',path)
-              elif new in s:
-                  print('already',path)
-              else:
-                  print('MISS',path,repr(old[:70])); sys.exit(1)
+          import re,sys
+          p='agent/overlay.js'; s=open(p,encoding='utf-8').read()
 
-          # ---- overlay: proper Java String -> JS string ----
-          rep('agent/overlay.js',
-              "function sendText(s){ const p=Memory.allocUtf8String(s); natives().text(p); }",
-              """function sendText(s){ const p=Memory.allocUtf8String(s); natives().text(p); }
-          function jstrToJs(j){
-            if(typeof j==='string') return j;
+          helpers='''let mainQueue=[], MainRunner=null;
+          function runOnMain(fn){
+            mainQueue.push(fn);
+            if(!MainRunner){
+              MainRunner=Java.registerClass({name:'re.tool.MR'+Date.now(),
+                implements:[Java.use('java.lang.Runnable')],
+                methods:{ run(){ while(mainQueue.length){ const f=mainQueue.shift(); try{ f(); }catch(e){ diag('main err '+e); } } } }});
+            }
+            Java.use('android.os.Handler').$new(Java.use('android.os.Looper').getMainLooper()).post(MainRunner.$new());
+          }
+          function currentActivity(){
             try{
-              const b=j.getBytes('UTF-8'); const n=b.length; const u=new Uint8Array(n);
-              for(let i=0;i<n;i++){ let x=b[i]; if(x<0)x+=256; u[i]=x; }
-              return new TextDecoder().decode(u);
-            }catch(e){ return ''+j; }
-          }""")
-          rep('agent/overlay.js',"const s=''+ed.toString();","const s=jstrToJs(ed.toString());")
+              const AT=Java.use('android.app.ActivityThread');
+              const at=AT.currentActivityThread();
+              const f=at.getClass().getDeclaredField('mActivities');
+              f.setAccessible(true);
+              const map=f.get(at);
+              const it=map.values().iterator();
+              const Activity=Java.use('android.app.Activity');
+              while(it.hasNext()){
+                const rec=it.next();
+                const rf=rec.getClass().getDeclaredField('activity');
+                rf.setAccessible(true);
+                const a=rf.get(rec);
+                if(a!==null){ const act=Java.cast(a,Activity); if(!act.isFinishing()) return Java.retain(act); }
+              }
+            }catch(e){ diag('currentActivity err '+e); }
+            return null;
+          }
+          '''
+          if 'function runOnMain' not in s:
+              s=s.replace('function attach(activity){', helpers+'function attach(activity){',1)
 
-          # ---- overlay: force first composition ----
-          rep('agent/overlay.js','overlayView=v;',
-              """overlayView=v;
-              try{
-                v.setVisibility(Java.use('android.view.View').VISIBLE.value);
-                v.bringToFront(); v.requestLayout(); v.invalidate();
-                decor.requestLayout(); decor.invalidate();
-                const Kick=Java.registerClass({name:'re.tool.Kick'+Date.now(),
-                  implements:[Java.use('java.lang.Runnable')],
-                  methods:{ run(){ try{ v.requestLayout(); v.invalidate(); decor.requestLayout(); decor.invalidate(); }catch(e){} } }});
-                Java.use('android.os.Handler').$new(Java.use('android.os.Looper').getMainLooper())
-                  .postDelayed(Kick.$new(),300);
-              }catch(e){}""")
-
-          # ---- core: lightweight record logging (no stack under JS lock) ----
-          rep('agent/core.js',
-          """function logCall(st,args,ret,phase){
-            const ch = st.track ? 'track' : 'record';
-            const id = st.track ? st.trackId : key(st.cls,st.name,st.ov);
-            const a = args.map(safeStr).join(', ');
-            const text = phase==='exit'
-              ? st.cls+'.'+st.name+'('+a+') -> '+safeStr(ret)
-              : st.cls+'.'+st.name+'('+a+')';
-            send({t:'log', ch:ch, id:id, cls:st.cls, name:st.name, text:text, stack:stack()});
-          }""",
-          """function logCall(st,args,ret,phase){
+          newstart='''function start(app){
             try{
-              const ch = st.track ? 'track' : 'record';
-              const id = st.track ? st.trackId : key(st.cls,st.name,st.ov);
-              const a = args.map(safeStr).join(', ');
-              const text = phase==='exit'
-                ? st.cls+'.'+st.name+'('+a+') -> '+safeStr(ret)
-                : st.cls+'.'+st.name+'('+a+')';
-              const stk = (ch==='track') ? stack() : [];
-              send({t:'log', ch:ch, id:id, cls:st.cls, name:st.name, text:text, stack:stk});
-            }catch(e){}
-          }""")
-          rep('agent/core.js',"if(tracing) logCall(st,a,null,'enter');",
-              "if(st.track&&st.trackOn) logCall(st,a,null,'enter');")
+              const LC=Java.registerClass({
+                name:'re.tool.LC'+Date.now(),
+                implements:[Java.use('android.app.Application$ActivityLifecycleCallbacks')],
+                methods:{
+                  onActivityCreated(a,b){}, onActivityStarted(a){},
+                  onActivityResumed(a){ const r=Java.retain(a); runOnMain(()=>attach(r)); },
+                  onActivityPaused(a){ detach(); },
+                  onActivityStopped(a){}, onActivitySaveInstanceState(a,b){},
+                  onActivityDestroyed(a){ detach(); }
+                }
+              });
+              app.registerActivityLifecycleCallbacks(LC.$new());
+              diag('lifecycle registered');
+              const a=currentActivity();
+              if(a){ diag('current activity found'); runOnMain(()=>attach(a)); }
+              else diag('no current activity yet');
+              let n=0;
+              function retry(){
+                if(n++>=6) return;
+                Java.performNow(()=>{
+                  const x=currentActivity();
+                  if(x){ diag('retry found activity'); runOnMain(()=>attach(x)); }
+                  else setTimeout(retry,300);
+                });
+              }
+              setTimeout(retry,300);
+            }catch(e){ diag('start err '+e); }
+          }'''
+          s2=re.sub(r'function start\(app\)\{[\s\S]*?\n\}', newstart, s, count=1)
+          if s2==s: print('MISS start function'); sys.exit(1)
+          open(p,'w',encoding='utf-8').write(s2)
+          print('overlay patched')
 
-          # ---- ui: cmath ----
-          rep('native/ui.cpp','#include <fstream>','#include <fstream>\n#include <cmath>')
+          u='native/ui.cpp'; t=open(u,encoding='utf-8').read()
+          old_begin='ImGui::Begin("##toggle",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoNav);'
+          new_begin='ImGui::Begin("##toggle",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoBackground|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoNav);'
+          if old_begin in t: t=t.replace(old_begin,new_begin,1); print('toggle NoBackground')
+          elif new_begin in t: print('already NoBackground')
+          else: print('MISS toggle begin'); sys.exit(1)
 
-          # ---- ui: neon triangle toggle (draggable + pulsing) ----
-          rep('native/ui.cpp',
-          """ImGui::SetNextWindowPos(ImVec2(8,140),ImGuiCond_FirstUseEver);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(6,6));
-            ImGui::Begin("##toggle",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoNav);
-            if(ImGui::Button(G.menuOpen?"X":"TOOL")) G.menuOpen=!G.menuOpen;
-            ImGui::End(); ImGui::PopStyleVar();""",
-          """static ImVec2 tpos(12,160);
-            ImGui::SetNextWindowPos(tpos,ImGuiCond_Always);
-            ImGui::SetNextWindowBgAlpha(0.0f);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(0,0));
-            ImGui::Begin("##toggle",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_AlwaysAutoResize|ImGuiWindowFlags_NoNav);
-            ImVec2 sz(72,72);
-            ImGui::InvisibleButton("##tgl",sz);
-            static bool dragging=false; static float moved=0;
+          old_drag="""static bool dragging=false; static float moved=0;
             if(ImGui::IsItemActivated()){ dragging=true; moved=0; }
             if(dragging&&ImGui::IsMouseDown(0)){ ImVec2 d=io.MouseDelta; moved+=fabsf(d.x)+fabsf(d.y); tpos.x+=d.x; tpos.y+=d.y; }
-            if(dragging&&ImGui::IsMouseReleased(0)){ dragging=false; if(moved<6.0f) G.menuOpen=!G.menuOpen; }
-            ImDrawList* dl=ImGui::GetWindowDrawList();
-            ImVec2 p=ImGui::GetItemRectMin();
-            ImVec2 c(p.x+sz.x*0.5f,p.y+sz.y*0.5f);
-            float t=(float)ImGui::GetTime();
-            float pulse=0.5f+0.5f*sinf(t*2.5f);
-            float r=30.0f;
-            ImVec2 a(c.x,c.y-r), b(c.x-r*0.87f,c.y+r*0.5f), cc(c.x+r*0.87f,c.y+r*0.5f);
-            dl->AddTriangle(a,b,cc,IM_COL32(0,255,150,(int)(70+120*pulse)),3.0f+2.0f*pulse);
-            dl->AddTriangle(a,b,cc,IM_COL32(0,168,107,255),1.5f);
-            float br=14.0f+2.0f*pulse;
-            dl->AddCircleFilled(c,br+4.0f,IM_COL32(200,80,255,(int)(90+150*pulse)),32);
-            dl->AddCircleFilled(c,br,IM_COL32(160,32,240,255),32);
-            dl->AddCircle(c,br,IM_COL32(255,255,255,200),32,1.5f);
-            dl->AddText(ImVec2(c.x-5,c.y-7),IM_COL32(255,255,255,255),"T");
-            ImGui::End(); ImGui::PopStyleVar();""")
-
-          # ---- ui: capped log list + stack popup (no per-frame stack rendering) ----
-          rep('native/ui.cpp',
-          """static void drawLog(std::deque<LogEntry>& log,bool openCls){
-            ImGui::BeginChild("##log",ImVec2(-1,220),true);
-            for(auto& e:log){
-              if(openCls&&!e.cls.empty()){ if(ImGui::Selectable(e.text.c_str())) openClass(e.cls); }
-              else ImGui::TextWrapped("%s",e.text.c_str());
-              drawStack(e.stack);
+            if(dragging&&ImGui::IsMouseReleased(0)){ dragging=false; if(moved<6.0f) G.menuOpen=!G.menuOpen; }"""
+          new_drag="""static bool pressed=false, dragMode=false; static ImVec2 pressPos, startPos;
+            if(ImGui::IsItemActivated()){ pressed=true; dragMode=false; pressPos=io.MousePos; startPos=tpos; }
+            if(pressed&&ImGui::IsMouseDown(0)){
+              ImVec2 d(io.MousePos.x-pressPos.x, io.MousePos.y-pressPos.y);
+              float dist=fabsf(d.x)+fabsf(d.y);
+              if(dist>8.0f) dragMode=true;
+              if(dragMode){ tpos.x=startPos.x+d.x; tpos.y=startPos.y+d.y; }
             }
-            if(ImGui::GetScrollY()>=ImGui::GetScrollMaxY()-4) ImGui::SetScrollHereY(1.0f);
-            ImGui::EndChild();
-          }""",
-          """static LogEntry g_detail; static bool g_detailOpen=false;
-          static void drawLog(std::deque<LogEntry>& log,bool openCls){
-            ImGui::BeginChild("##log",ImVec2(-1,220),true);
-            int n=(int)log.size(); int start=std::max(0,n-150);
-            for(int i=start;i<n;i++){
-              auto& e=log[i];
-              ImGui::PushID(i);
-              if(ImGui::Selectable(e.text.c_str())){
-                if(openCls&&!e.cls.empty()) openClass(e.cls);
-                else if(!e.stack.empty()){ g_detail=e; g_detailOpen=true; }
-              }
-              ImGui::PopID();
-            }
-            if(ImGui::GetScrollY()>=ImGui::GetScrollMaxY()-4) ImGui::SetScrollHereY(1.0f);
-            ImGui::EndChild();
-          }""")
-          rep('native/ui.cpp','float y=io.DisplaySize.y-30;',
-          """if(g_detailOpen){ ImGui::OpenPopup("Call stack"); g_detailOpen=false; }
-            if(ImGui::BeginPopupModal("Call stack",nullptr,ImGuiWindowFlags_AlwaysAutoResize)){
-              for(auto& f:g_detail.stack){ if(ImGui::Selectable(f.s.c_str())){ openClass(f.c); ImGui::CloseCurrentPopup(); } }
-              if(ImGui::Button("Close")) ImGui::CloseCurrentPopup();
-              ImGui::EndPopup();
-            }
-            float y=io.DisplaySize.y-30;""")
-          print('PATCHES OK')
+            if(pressed&&ImGui::IsMouseReleased(0)){ pressed=false; if(!dragMode) G.menuOpen=!G.menuOpen; dragMode=false; }"""
+          if old_drag in t: t=t.replace(old_drag,new_drag,1); print('toggle click/drag fixed')
+          elif new_drag in t: print('already click/drag')
+          else: print('MISS drag block'); sys.exit(1)
+          open(u,'w',encoding='utf-8').write(t)
+          print('UI PATCHES OK')
           PY
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add agent native
-          git diff --cached --quiet || { git commit -m "stage2: IME text fix, first-show kick, recorder contention fix, neon toggle [skip ci]"; git push; }
+          git diff --cached --quiet || { git commit -m "stage3: current-activity reflection + main-thread attach + toggle click/border [skip ci]"; git push; }
 
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
@@ -238,7 +196,7 @@ jobs:
       - name: Upload clean artifact (3 files only)
         uses: actions/upload-artifact@v4
         with:
-          name: libtool-stage2
+          name: libtool-stage3
           path: |
             out/tooltest.apk
             out/libtool-arm64-v8a.so
